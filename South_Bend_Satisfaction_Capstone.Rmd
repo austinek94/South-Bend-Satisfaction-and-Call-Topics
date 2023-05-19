@@ -1,0 +1,2874 @@
+---
+title: "Calling All Neighbors:"
+author: "A Data-Driven Assessment of South Bend’s City Services & Community Needs"
+date: 'Trevor Coville, Ana Dominguez, Helen Flynn, Austin Kim, Cole Leppert, Alexa Myers'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(message=FALSE,warning = FALSE, echo=FALSE)
+knitr::opts_knit$set(root.dir = "~/Files for Final Report/")
+setwd("~/Files for Final Report/")
+
+library(tidyverse)
+library(ggmap)
+library(janitor)
+library(sf)
+library(tidytext)
+library(caret)
+library(cluster)
+library(corrplot)
+library(dplyr)
+library(factoextra)
+library(faraway)
+library(ggplot2)
+library(kableExtra)
+library(lubridate)
+library(MASS)
+library(osmdata) # package for working with streets
+library(RColorBrewer)
+library(reshape2)
+library(ResourceSelection)
+library(rpart)
+library(rvest)
+library(semPlot)
+library(showtext) # for custom fonts
+library(tableHTML)
+library(plotly)
+library(reactable)
+library(viridis)
+```
+
+# Introduction
+
+The City of South Bend's Department of Innovation & Technology serves the community by leveraging technology, data, and design to empower the city's workforce and improve the quality of life for those in the region.
+
+This project focuses on helping the department evaluate data collected from the American Community Survey, the South Bend Community Survey, and 311 call logs. The city has already evaluated these data sets individually and currently presents insights from this analysis within interactive visualizations on their website. Our task is to continue this exploration of the data sources, but to expand on it by aggregating these data sets to generate new insights.
+
+The City would like to understand if they are fulfilling the needs of their residents in their day-to-day lives. Insights will be generated to provide resolution on the district level to evaluate areas of the city that can be highlighted for future investment or evaluated for efficacy of instated programs.
+
+The city hopes to understand the story that these three data sets can tell when evaluated together and will use insights from this evaluation to assess and improve resident services, city outreach, and equity among residents and neighborhoods. Below are the particular insights that are investigated in this report.
+
+![](insights.png)
+
+## Data Sources
+
+### Data Import, Cleaning and Aggregation
+
+Before we begin our analysis, we first have to load in all of our relevant data sources and aggregate them together to a workable format. This became quite a lot of code, so we decided to intentionally hide this code from our final report but it is included in the R Markdown version so that you can easily reproduce all of the data cleaning done for our work.
+
+```{r, include=FALSE}
+## Create functions for cleaning datasets:
+
+### Retains columns if and only if all observations are not null
+not_all_na <- function(x) any(!is.na(x))
+
+### Retains columns if and only if there is more than 1 value / non-null value in a column
+load_data_clean <- function(path_to_csv) {
+  read_csv(path_to_csv) %>%
+  mutate(across(where(is.character), ~na_if(., "NULL"))) %>%
+  dplyr::select(where(not_all_na)) %>%
+  dplyr::select(where(~n_distinct(.) > 1))
+}
+
+```
+
+```{r, warning=FALSE, message=FALSE, include=FALSE}
+### Read in data:
+
+#### Import relevant 311 CRM data:
+
+# Please note that these data were stored in CSV files
+# are represented the data present in the SQL database as of 2/14/2023.
+
+phonecall <- read_csv("phonecall_cleaned.csv")
+servicerequest <- read_csv("servicerequest_cleaned.csv")
+knowledgeinteraction <- read_csv("knowledgeinteraction_cleaned.csv")
+```
+
+```{r, include=FALSE}
+#### Join knowledge interaction with phonecall data with common phonecall id
+## This function combines all information captured in both the phone call
+## and knowledge interaction datasets and combines them into one data frame.
+
+knowledgeinteraction$activityid <- knowledgeinteraction$cosb_phonecall
+
+knowledgeint_phonecall_join <- inner_join(x=knowledgeinteraction,y=phonecall,
+                                          by="activityid")
+```
+
+```{r, include=FALSE}
+## Join service request and knowledge interaction tables.
+## This function combines all information captured in both the service request
+## and knowledge interaction data sets and combines them into one data frame.
+servicerequest$cosb_servicerequest <- servicerequest$cosb_servicerequestid
+knowledgeint_servicereq_join <- inner_join(x=knowledgeinteraction, 
+                                           y = servicerequest,
+                                           by="cosb_servicerequest")
+```
+
+```{r, include=FALSE}
+## Merge two previously merged dataframes to the knowledgeinteraction, so 
+## that all relevant details from the phonecall and servicerequest data fields 
+## are populated. Articles with missing values in merge column are removed.
+
+ki_merged <- inner_join(x=knowledgeint_phonecall_join, y = servicerequest,by="cosb_servicerequest")
+```
+
+```{r, include=FALSE}
+#### Geometry Generation: Creating Coordinates from Latitiude and Longitude
+
+## This step allows us to create a geometry column for each data point
+## to map where service requests and calls were made.
+ki_locs <- ki_merged %>%
+  drop_na(c(cosb_location__longitude,cosb_location__latitude)) %>% #projecting the table as an sf and setting the coordinate system
+  sf::st_as_sf(coords = c("cosb_location__longitude","cosb_location__latitude")) %>% 
+  sf::st_set_crs(value = 4326) 
+
+ki_locs$geometry_k <- ki_locs$geometry
+
+```
+
+```{r, include=FALSE}
+#### Download census tract geometries
+## By adding in the census tract geometries, indiviudal points where
+## calls were made can be generalized to a census tract region.
+
+census <- st_read("census_tracts.shp") %>%
+  st_transform("EPSG:4326") %>%
+  dplyr::select(TRACTCE, GEOID, NAME,geometry)
+
+census$TRACT <- census$TRACTCE
+census$TRACTCE <- census$NAME
+
+census$geometry_c <- census$geometry
+
+```
+
+```{r, include=FALSE}
+#### Merging datasets to capture observations by census tract:
+## Goal: add column with Census Tract ID to 311 knowledge interaction data.
+
+
+#rdsConvert to sf-objects
+census.sf <- st_as_sf(census)
+ki.sf <- st_as_sf(ki_locs)
+
+# Keep all "meuse.sf", sort by row.names(meuse.sf). Default overlay is "intersects".
+ki_sf <- st_join(ki.sf, census.sf) 
+```
+
+```{r, include=FALSE}
+### Import Community Survey
+
+#### Clean names to make variable names interpretable
+#### Count the number of time each zip code is referenced in the data, and remove data for all zips where there are fewer than 10 observations
+
+#### Change missing (0) and NA (9) data to NaNs
+##### Note: you will not want to remove 9s for the investment preferences. 
+
+
+com_survey <- read_csv("2022_City_of_South_Bend_Community_Survey_Data.csv") %>%
+  janitor::clean_names() %>% add_count(zip) %>% 
+  filter(n > 10)
+com_survey[com_survey==0 | com_survey==9] <- NA
+```
+
+```{r, include=FALSE}
+#### Converting the Community Survey into a Shapefile
+## This requires rescaling the latitude and longitude variables
+## to be on the CRS 4326 system.
+
+com_survey_sf <- com_survey %>%
+  drop_na(c(block_lon,block_lat)) %>% 
+  mutate(lat=block_lat/1000000) %>%
+  mutate(lng = block_lon/1000000) %>%
+  sf::st_as_sf(coords = c("lng","lat")) %>% 
+  sf::st_set_crs(value = 4326) 
+
+```
+
+```{r, include=FALSE}
+#### Adding census tract to survey response data
+# Keep all "survey data", add census tract from census data.
+com_survey_sf <- st_join(com_survey_sf, census) %>%
+  add_count(TRACTCE) 
+
+```
+
+```{r, include=FALSE}
+#### Reading in Population Data
+populations = read_csv("DECENNIAL.csv") %>%
+  dplyr::rename(Population = ...3)
+populations$TRACTCE = as.character(populations$TRACTCE)
+
+ki_percap = left_join(ki_sf, populations) %>%
+  group_by(TRACTCE,Population) %>%
+  dplyr::summarize(Num_Calls = n()) %>%
+  mutate(Calls_Per_Capita = Num_Calls/Population)
+```
+
+```{r,include=FALSE}
+#### Reading in Demographics Data From ACS
+
+age_and_sex = read.csv('age_and_sex.csv')
+age_and_sex = age_and_sex %>%
+  mutate_if(is.character, str_trim)
+
+race = read.csv('race.csv')
+race = race %>%
+  mutate_if(is.character, str_trim)
+
+
+poverty_status = read.csv('poverty_status.csv')
+poverty_status = poverty_status %>%
+  mutate_if(is.character, str_trim)
+
+poverty_status = poverty_status%>%
+  mutate(poverty_status = case_when(
+    (str_detect(poverty_status,'Below 100 percent of the poverty level')) ~ 'Below_100_percent_of_the_poverty_level',
+    (str_detect(poverty_status,'100 to 149 percent of the poverty level')) ~ 'At_100_to_149_percent_of_the_poverty_level',
+    (str_detect(poverty_status,'At or above 150 percent of the poverty level')) ~ 'At_or_above_150_percent_of_the_poverty_level'
+    ))
+
+income_over_15 = read.csv('income_over_15.csv')
+income_over_15 = income_over_15 %>%
+  mutate_if(is.character, str_trim)
+
+education_over_25 = read.csv('education_over_25.csv')
+education_over_25 = education_over_25 %>%
+  mutate_if(is.character, str_trim)
+
+ethnicity = read.csv('ethnicity.csv')
+ethnicity = ethnicity %>%
+  mutate_if(is.character, str_trim)
+
+marital_status_over_15 = read.csv('marital_status_over_15.csv')
+marital_status_over_15 = marital_status_over_15 %>%
+  mutate_if(is.character, str_trim)
+
+age =  read.csv('age.csv')
+age = age %>%
+  mutate_if(is.character, str_trim)
+
+sex =  read.csv('sex.csv')
+sex = sex %>%
+  mutate_if(is.character, str_trim)
+
+pops = read_csv('Census_Tract_Pops.csv')
+pops = pops %>%
+  mutate_if(is.character, str_trim)
+```
+
+```{r, message=FALSE}
+## Loading Data and Libraries For Investment Preference Anlaysis
+
+Satisfaction2022 <- read.csv("AvgSatisfcationByCT_2022.csv")
+CallVolume <-read_csv("CallVolumeByCT_AllYears.csv")
+CallTopicMap <-read_csv("CallTopicColorChart.csv")
+InvestTopicMap <-read_csv("InvestTopicColorChart.csv")
+InvestTopicMap2 <-read_csv("InvestTopicColorChart2.csv")
+InvestTopicMapQ23 <-read_csv("InvestTopicColorChartQ23.csv")
+InvestTopicMapQ25 <-read_csv("InvestTopicColorChartQ25.csv")
+InvestTopicMapQ27 <-read_csv("InvestTopicColorChartQ27.csv")
+InvestTopicMapQ29 <-read_csv("InvestTopicColorChartQ29.csv")
+InvestTopicMapQ31 <-read_csv("InvestTopicColorChartQ31.csv")
+
+
+#Data Transformation
+
+#Removal of Sentiment fields, index, and Total Calls fields
+CallVolume  <-  dplyr::select(CallVolume, -1, -4, -21, -22)
+#Sub setting Responses Related to Departmental Satisfaction
+Satisfaction2022Deps <-  dplyr::select(Satisfaction2022, -1, -3, -4, -15:-77)
+#Sub setting Responses Related to Overall Investment Preference
+Satisfaction2022Invs <-  dplyr::select(Satisfaction2022, -1, -3:-14, -18:-77)
+#Sub setting Responses Related to Water
+Satisfaction2022DisQ29  <-  dplyr::select(Satisfaction2022, -1, -3:-67, -70:-77)
+#Sub setting Responses Related to Neighborhood Services and Enforcement
+Satisfaction2022DisQ21  <-  dplyr::select(Satisfaction2022, -1, -3:-23, -26:-77)
+#Sub setting Responses Related to Solid Waste
+Satisfaction2022DisQ23  <-  dplyr::select(Satisfaction2022, -1, -3:-30, -33:-77)
+#Sub setting Responses Related to Public Safety
+Satisfaction2022DisQ25  <-  dplyr::select(Satisfaction2022, -1, -3:-42, -46:-77)
+#Sub setting Responses Related to Traffic and Transportation
+Satisfaction2022DisQ26  <-  dplyr::select(Satisfaction2022, -1, -3:-56, -58:-77)
+#Sub setting Responses Related to Parks and Arts
+Satisfaction2022DisQ31  <-  dplyr::select(Satisfaction2022, -1, -3:-75)
+```
+
+## 311 CRM Data
+
+The 311 Call Center (311.southbendin.gov) is responsible for facilitating citizens’ needs through various city services. Any South Bend resident calls 311 to address issues and needs including trash pickup, reporting potholes, water quality issues, and much more. All of the data on 311 calls is tracked in the city’s citizen relationship management (CRM) system in various tables that include information on the phone call, knowledge interactions (the topic of the call), or service requests that may result from the call. Below are some basic definitions and summary statistics about the 311 call data.
+
+![](311_data2.png)
+
+- Service Request: after an interaction between the city and a resident has been recorded, calls that require follow-up service or attention from a city department are registered as service requests. A service request directs follow-up for completion of work to a specific organizational unit within the city, such as Neighborhood Services, Sewers, Streets, or Solid Waste.
+- Knowledge Link: The knowledge link describes the interaction between a service request and a knowledge article. This is the intersection between the tables that aggregates call details with any references to city resources captured in knowledge articles.
+- Knowledge Article: A previously defined resource document to which a given service can be attached. These documents can serve as a reference for the type of work to be completed to close out a service request.
+
+### Call Volume and Resulting Service Requests
+
+The following plot displays the volume of 311 calls and the percentage that resulted in a service request from 2018 to 2022.
+
+![](311_volume.png)
+
+The 311 call volume has decreased over the years. However, it is important to note that the percentage of 311 calls resulting in service requests has increased.
+
+### Service Requests By Census Tract
+
+Below displays the total number of service requests by Census Tract. Use the toggle to the right to filter to a particular Census Tract and view their total number of service requests fulfilled over time.
+
+```{r, include=FALSE}
+### CAN REMOVE -- duplicate from Helens code
+### Service Requests by Census Tract
+phonecall <- read_csv("phonecall_cleaned.csv")
+servicerequest <- read_csv("servicerequest_cleaned.csv")
+knowledgeinteraction <- read_csv("knowledgeinteraction_cleaned.csv")
+
+knowledgeinteraction$activityid <- knowledgeinteraction$cosb_phonecall
+knowledgeint_phonecall_join <- inner_join(x=knowledgeinteraction,y=phonecall,by="activityid")
+
+servicerequest$cosb_servicerequest <- servicerequest$cosb_servicerequestid
+knowledgeint_servicereq_join <- inner_join(x=knowledgeinteraction, y = servicerequest,by="cosb_servicerequest")
+
+ki_merged <- inner_join(x=knowledgeint_phonecall_join, y = servicerequest,by="cosb_servicerequest")
+
+ki_locs <- ki_merged %>%
+  drop_na(c(cosb_location__longitude,cosb_location__latitude)) %>% #projecting the table as an sf and setting the coordinate system
+  sf::st_as_sf(coords = c("cosb_location__longitude","cosb_location__latitude")) %>% 
+  sf::st_set_crs(value = 4326) 
+
+ki_locs$geometry_k <- ki_locs$geometry
+
+census_tracts <- st_read("census_tracts.shp") %>%
+  st_transform("EPSG:4326") %>%
+  dplyr::select(TRACTCE, GEOID, NAME,geometry)
+
+census_tracts$TRACT <- census_tracts$TRACTCE
+census_tracts$TRACTCE <- census_tracts$NAME
+
+census_tracts$geometry_c <- census_tracts$geometry
+
+#rdsConvert to sf-objects
+census.sf <- st_as_sf(census_tracts)
+ki.sf <- st_as_sf(ki_locs)
+
+# Keep all "meuse.sf", sort by row.names(meuse.sf). Default overlay is "intersects".
+ki_sf <- st_join(ki.sf, census.sf) 
+```
+
+```{r, include=FALSE}
+# some srs removed due to not having a date
+sr.df <- ki_sf %>%
+  ungroup() %>%
+  select(TRACTCE, actualend, cosb_totalservicerequests) %>%
+  data.frame() %>%
+  mutate(Year = year(actualend)) %>%
+  select(-geometry, -actualend) %>%
+  group_by(TRACTCE, Year) %>%
+  summarise(Total = sum(cosb_totalservicerequests)) %>%
+  na.omit()
+
+names(sr.df)[1] <- "CensusTract"
+sr.df$Year <- as.factor(sr.df$Year)
+```
+
+```{r, echo=FALSE, warning=FALSE}
+fig <- plot_ly(sr.df,
+               x = ~Year,
+               y = ~Total,
+               type = "bar",
+               hovertemplate = "Total: %{y} <extra></extra>",
+               marker = list(color = "#21918c"),
+               transforms = list(
+                 list(
+                   type = 'filter',
+                  target = ~CensusTract,
+                 operation = '=',
+                 value = unique(sr.df$CensusTract)[1]
+                 )
+               ))
+
+annot <- list(list(text = "Census<br>Tract",
+                   x=0.95, y=1.1,
+                   xref='paper', yref='paper',
+                   showarrow=FALSE))
+
+fig <- fig %>% layout(title = "Total Service Requests by Year",
+                      xaxis = list(list(type = "category"), title = ""),
+                      updatemenus = list(
+                        list(type = 'dropdown',
+                             active = 0,
+                             x = 1.1,
+                             y = 1.1,
+                             buttons = apply(as.data.frame(unique(sr.df$CensusTract)), 1,
+                                             function(x) list(method = 'restyle',
+                                                              args = list('transforms[0].value',x),
+                                                              label = x)))),
+                      annotations = annot) %>% hide_colorbar()
+
+fig
+
+```
+
+## South Bend Community Survey
+
+The South Bend Community Survey (https://southbendin.gov/communitysurvey) is a biannual survey administered by community leaders to assess resident perceptions, priorities, and satisfactions. The surveys are anonymously collected via mail, phone, and online. The survey aggregates 11 different questions with a total of 56 total sub-questions to assess resident satisfaction, investment preferences, and city resource interaction. 
+
+The following city services are assessed in the community survey.
+
+- Overall Quality of Life
+- Trash
+- Parks & Recreation 
+- Water
+- Local Police
+- City Planning
+- Law Enforcement
+- Construction
+- City Maintenance
+
+### Response Volume
+
+The following plot displays the number of responses to the South Bend Community Survey for the last three surveys (2018, 2020, 20022).
+
+![](sbcs_volume.png)
+
+For the past 3 surveys, the number of responses has been relatively consistent, ranging from 639 to 682 per year.
+
+### City Service Satisfaction
+
+In the survey, the satisfaction of different city services is measured on a likert scale, where 1 represents being extremely unsatisfied and 5 represents being extremely unsatisfied with a city service. Below displays the average satisfaction for a subset of city services measured in the last three community surveys.
+
+![](satisfaction.png) 
+
+It is important to note that for the last six years, overall satisfaction has remained relatively steady. The satisfaction is trash services has increased over time, and the satisfaction with city planning and local enforcement have decreased over time.
+
+Below displays the satisfaction for the different City Services measured in the South Bend Community Survey for the last 3 surveys by Census Tract. The toggles to the right filter the plot to examine the satisfaction by a particular Census Tract and City Service.
+
+```{r, echo=FALSE, warning=FALSE}
+# read data
+sbcs.df <- read.csv("Average_Satisfaction_by_CT.csv") %>% select(-X) %>% na.omit()
+sbcs.df$Year <- as.factor(sbcs.df$Year)
+
+fig <- plot_ly(sbcs.df,
+               x = ~Year,
+               y = ~Satisfaction,
+               type = "bar",
+               marker = list(color = "#21918c"),
+               hovertemplate = "Satisfaction: %{y} <extra></extra>",
+               transforms = list(
+                 list(type = 'filter',
+                      target = ~CensusTract,
+                      operation = '=',
+                      value = unique(sbcs.df$CensusTract)[1]),
+                 list(type = 'filter',
+                      target = ~Service,
+                      operation = '=',
+                      value = unique(sbcs.df$Service)[1]))
+               )
+
+annot <- list(list(text = "Census<br>Tract",
+                   x=0.95, y=1.2,
+                   xref='paper', yref='paper',
+                   showarrow=FALSE))
+
+fig <- fig %>% layout(title = "Average Satisfaction (1-5) by Year",
+                      xaxis = list(list(type = "category"), title = ""),
+                      updatemenus = list(
+                        list(type = 'dropdown',
+                             active = 0,
+                             x = 1.15,
+                             y = 1.2,
+                             buttons = apply(as.data.frame(unique(sbcs.df$CensusTract)), 1, 
+                                             function(x) list(method = 'restyle',
+                                                              args = list('transforms[0].value',x),
+                                                              label = x))),
+                        list(type = 'dropdown',
+                             active = 0,
+                             x = 1.15,
+                             y = 1.1,
+                             buttons = apply(as.data.frame(unique(sbcs.df$Service)), 1,
+                                             function(x) list(method = 'restyle',
+                                                              args = list('transforms[1].value',x),
+                                                              label = x)))),
+
+                      annotations = annot) %>% hide_colorbar()
+
+fig
+
+```
+
+## Census Data
+
+The United States’ Census Bureau (data.census.gov) collects annual survey data to analyze social, economic, and geographic conditions of the United States, states, and counties. One of these surveys, the American Community Survey (ACS) helps local officials, community leaders, and businesses understand the changes taking place in their communities. It is the premier source for detailed population and housing information about our nation. The following tables from the 2020 ACS were used for this analysis.The tables were tabulated by Census Tract in St. Joseph County, Indiana.
+
+Tables:
+
+- Age
+- Sex
+- Race/Ethnicity
+- Education Over Age 25
+- Income Over Age 15
+- Poverty Level
+- Marital Status Over Age 15
+
+# 311 Usage & Reporting Behavior
+
+### Community Survey Respondents by Census Tract
+
+Upon investigating the address provided by community survey respondents, a map was generated to share areas of the city where respondents are located. In total, survey responses were captured in 48 out of the 81 census tracts comprising St. Joseph County.
+
+```{r, message=FALSE}
+ggplot() +
+  theme(legend.position = "n") +
+  geom_sf(data=census$geometry_c) +
+  geom_sf(data = com_survey_sf,aes(alpha=.1,color = TRACTCE)) +
+  geom_sf(data = com_survey_sf$geometry_c,aes(stroke=0,fill=com_survey_sf$TRACTCE,alpha=.00001)) +
+  coord_sf(crs = 4326, xlim = c(-86.4, -86.14), ylim = c(41.56, 41.756))+
+  geom_sf_text(data=census,label=census$TRACTCE,size=2.4) +
+  ggtitle("South Bend Survey Community Survey:\nResponses by Census Tract") 
+
+
+```
+
+#### Community Survey Respondents grouped by Census Tract:
+
+-   Census Tract 32 has the largest number of respondents at 33; tracts 111, 112.03, 113.03, 115.01, 117.04, and 19 rank lowest with 1 respondent each.
+
+
+Here is the top 10 Census Tracts based on Community Survey Responses:
+```{r, message=FALSE}
+library(kableExtra)
+ct_resp_output = data.frame(com_survey_sf) %>%
+  group_by(TRACTCE) %>%
+  dplyr::rename("Census Tract"=TRACTCE) %>%
+  dplyr::summarize("Count Respondents" = n()) %>%
+  arrange(desc("Count Respondents")) 
+
+ct_resp_output$`Census Tract` = str_replace(ct_resp_output$`Census Tract`, ".00", "")
+
+kable(ct_resp_output %>% 
+  dplyr::select('Census Tract', "Count Respondents") %>%
+  slice_max(ct_resp_output$`Count Respondents`, n=10)) %>%
+  kable_styling(position = "center")
+```
+
+
+And this is the bottom 10 Census Tracts based on Community Survey Responses:
+```{r}
+kable(ct_resp_output %>% 
+  dplyr::select('Census Tract', "Count Respondents") %>%
+  slice_min(ct_resp_output$`Count Respondents`, n=10)) %>%
+  kable_styling(position = "center")
+```
+
+### 311 Service Requests by Census Tract
+
+The map below displays the locations of 82,279 total service requests placed in the City. Service requests were made in 71 census tracts, with tract 31 leading with 4,325 unique requests.
+
+
+Here are the top 10 Census Tracts based on the number of Service Requests:
+```{r, message=FALSE}
+ct_service_output = data.frame(ki_sf) %>%
+  group_by(TRACTCE) %>%
+  dplyr::rename("Census Tract"=TRACTCE) %>%
+  dplyr::summarize("Service Requests" = n())
+  
+
+kable(ct_service_output %>% 
+  dplyr::select('Census Tract', "Service Requests") %>%
+  slice_max(ct_service_output$`Service Requests`, n=10)) %>%
+  kable_styling(position = "center")
+
+```
+
+And here are the bottom 10 Census Tracts based on the number of Service Requests:
+```{r}
+kable(ct_service_output %>% 
+  dplyr::select('Census Tract', "Service Requests") %>%
+  slice_min(ct_service_output$`Service Requests`, n=10)) %>%
+  kable_styling(position = "center")
+```
+
+#### Calculating Per Capita Request Rates for the City
+
+Next, to acknowledge that the population of each census tract is varied, we seek to understand the leading tracts using 311 as a function of each tract's population. To achieve this, we read in a file from the Decennial Census of 2020 that lists the populations for each census tract. Below, we show the bottom 20 census tracts by calls per capita.
+
+Additionally, we have plotted calls per capita on the county map; we immediately notice that Census Tract 21 has the highest number of calls per capita at **3.36** calls per capita. While this is quite an interesting data point, we omit this tract and regenerate the city map to evaluate the other tracts on their own scale due to the magnitude of Tract 21's call volume.
+
+From the omitted county map, we see that the neighboring districts also show a relatively high call volume per capita. Census Tracts 4 and 5 are next highest, at 1.33 and 1.35 calls per capita, respectively.
+
+
+This is the top 10 Census Tracts based on Calls per Capita:
+```{r, message=FALSE}
+populations = read_csv("DECENNIAL.csv") %>%
+  dplyr::rename(Population = ...3)
+populations$TRACTCE = as.character(populations$TRACTCE)
+populations = populations[-1,]
+
+ki_percap = left_join(ki_sf, populations) %>%
+  group_by(TRACTCE,Population) %>%
+  dplyr::summarize(Num_Calls = n()) %>%
+  mutate(Calls_Per_Capita = Num_Calls/Population) 
+
+kable(data.frame(ki_percap) %>%
+                   dplyr::select(TRACTCE, Calls_Per_Capita,Num_Calls,Population) %>% 
+                   slice_max(Calls_Per_Capita,n=10) %>%
+  dplyr::rename("Census Tract" = TRACTCE, 
+                "Calls Per Capita" = Calls_Per_Capita,
+                "Number of Calls" = Num_Calls)) %>%
+  kable_styling(position = "center")
+```
+
+
+And this is the bottom 10 Census Tracts based on Calls per Capita:
+```{r}
+kable(data.frame(ki_percap) %>%
+                   dplyr::select(TRACTCE, Calls_Per_Capita,Num_Calls,Population) %>%
+                   slice_min(Calls_Per_Capita,n=10) %>%
+  dplyr::rename("Census Tract" = TRACTCE, 
+                "Calls Per Capita" = Calls_Per_Capita,
+                "Number of Calls" = Num_Calls)) %>%
+  kable_styling(position = "center")
+```
+
+```{r, message=FALSE}
+ki_code = ki_sf %>%
+  group_by(TRACTCE) %>%
+  filter(grepl('Code', cosb_knowledgearticlename.x)) %>%
+  dplyr::summarize(count_calls = n()) %>%
+  left_join(populations) %>%
+  mutate(per_cap = count_calls/Population)
+
+```
+
+```{r, message=FALSE}
+count_calls_per_tract = ki_sf %>%
+  group_by(TRACTCE) %>%
+  dplyr::summarize(count=n()) %>%
+  left_join(populations) %>%
+  mutate(calls_per_cap = count/Population) %>%
+  dplyr::select(TRACTCE,Population,calls_per_cap) %>%
+  st_join(census)
+
+ggplot() + 
+  geom_sf(data=census$geometry_c) +
+  geom_sf(data=count_calls_per_tract$geometry_c,aes(fill=count_calls_per_tract$calls_per_cap,alpha=.5)) +
+  coord_sf(crs = 4326, xlim = c(-86.40, -86.1), ylim = c(41.54, 41.755)) +
+  geom_sf_text(data=census$geometry_c,label=census$TRACTCE,size=2.4) +
+  scale_fill_stepsn(n.breaks = 5, colors =hcl.colors(5)) +
+  ggtitle("Low 311 Usage, Based on 311 Calls",
+          subtitle="CRM data filtered to match 47 counties \nrepresented in the Community Survey") +
+  theme(plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle =  element_text(size = 12, face = "bold"))+
+  guides(alpha="none",size="none")
+
+```
+
+```{r, message=FALSE}
+
+count_calls_omit <- count_calls_per_tract %>%
+  filter(TRACTCE.x != "21")
+
+ggplot() + 
+  geom_sf(data=census$geometry_c ) +
+  geom_sf(data=count_calls_omit$geometry_c,aes(fill=count_calls_omit$calls_per_cap,alpha=.5)) +
+  coord_sf(crs = 4326, xlim = c(-86.40, -86.1), ylim = c(41.54, 41.755)) +
+  geom_sf_text(data=census$geometry_c,label=census$TRACTCE,size=2.4) +
+  scale_fill_stepsn(n.breaks = 5, colors =hcl.colors(5)) +
+  ggtitle("Low 311 Usage, Based on 311 Calls",
+          subtitle="Tract 21 Removed as Outlier") +
+  theme(plot.title = element_text(size = 16, face = "bold"),
+        plot.subtitle =  element_text(size = 12, face = "bold"))+
+  guides(alpha="none",size="none")
+```
+
+```{r, message=F, echo = FALSE}
+
+ki_raw <- read_csv("knowledge_ints.csv")
+com_survey_raw <- read_csv("com_survey_filtered.csv")
+```
+
+```{r, message=F, echo = FALSE}
+ki_sf_raw <- ki_raw %>%
+  drop_na(c(cosb_location__longitude,cosb_location__latitude)) %>% #projecting the table as an sf and setting the coordinate system
+  sf::st_as_sf(coords = c("cosb_location__longitude","cosb_location__latitude")) %>% 
+  sf::st_set_crs(value = 4326) 
+
+ki_sf_raw$geometry_ki <- ki_sf_raw$geometry
+
+ki_sf <- st_join(ki_sf_raw,census)
+```
+
+```{r, message=F, echo = FALSE}
+### Add geometry columns to community survey data:
+
+com_survey_sf <- com_survey_raw %>%
+  drop_na(c(block_lon,block_lat)) %>% 
+  mutate(lat=block_lat/1000000) %>%
+  mutate(lng = block_lon/1000000) %>%
+  sf::st_as_sf(coords = c("lng","lat")) %>% 
+  sf::st_set_crs(value = 4326)
+
+com_survey_sf$geometry_obs <- com_survey_sf$geometry
+
+# Keep all "com_survey_sf", add census tract
+com_survey_sf <- st_join(com_survey_sf, census) 
+```
+
+```{r, message=FALSE, echo = FALSE}
+### Read in ACS Decennial Survey Data
+
+acs_raw <- read_csv("Decennial_demos_ACS_cleaned.csv") %>%
+  clean_names() %>%
+  dplyr::rename(TRACTCE=x1)
+
+
+acs_demos <- read_csv("ACS_demographics.csv") %>%
+  dplyr::rename(TRACTCE=`Census Tract`)
+
+#acs_demos$TRACTCE <- as.numeric(acs_demos$TRACTCE)
+census$TRACTCE <- as.double(census$TRACTCE)
+
+acs_demos <- left_join(acs_demos,acs_raw[ , c("TRACTCE", "total")],by="TRACTCE")
+
+acs_demos <- left_join(acs_demos,census,by="TRACTCE") %>%
+  sf::st_as_sf() %>% 
+  sf::st_set_crs(value = 4326)
+```
+
+```{r, warning=F, message=F, echo = FALSE}
+com_survey_ranked <- com_survey_sf %>%
+  dplyr::select(q1_01_1_overall_quality_of_life_in_y,
+         q1_06_6_level_of_public_involvement,
+         q1_08_8_overall_quality_of_community,
+         q1_09_9_overall_efforts_to_improve_h,
+         q4_01_1_availability_of_information,
+         q9a_how_did_you_contact_the_city,
+         q9b_did_you_contact_311,
+         q9c_how_easy_was_it_to_address_your_iss,
+         q10_10_10_overall_maintenance_of_cit,
+         q10_03_03_overall_quality_of_trash_c,
+         q10_08_08_overall_enforcement_of_loc,
+         q12_05_5_overall_appearance_of_your_n,
+         q15_how_well_informed_do_you_believe_yo,
+         q20_02_2_city_efforts_to_remove_aban,
+         q20_03_3_enforcing_clean_up_of_trash,
+         q20_04_4_enforcing_mowing_and_cuttin,
+         q20_05_5_enforcing_exterior_maintena,
+         q20_06_6_enforcing_exterior_maintena,
+         q22_01_1_timeliness_of_your_trash_se,
+         q22_02_2_city_efforts_to_keep_you_in,
+         q22_03_3_bulky_item_pick_up_removal,
+         q24_02_02_professionalism_of_city_p,
+         q26_03_03_adequacy_of_street_lighting,
+         q26_02_02_condition_of_street_signs_a,
+         q26_11_11_condition_of_major_city_str,
+         TRACTCE,
+         geometry) %>%
+  group_by(TRACTCE) %>%
+  dplyr::mutate(ct = n()) %>%
+  dplyr::summarise_each(funs(mean(., na.rm = TRUE))) %>%
+  mutate(rank_q1_01 = min_rank(desc(q1_01_1_overall_quality_of_life_in_y)),
+         rank_q9b = min_rank(desc(q9b_did_you_contact_311)),
+         rank_q9c = min_rank(desc(x = q9c_how_easy_was_it_to_address_your_iss)),
+         rank_q9c = min_rank(desc(x = q9c_how_easy_was_it_to_address_your_iss)),
+         rank_q10_08 = min_rank(desc(x = q10_08_08_overall_enforcement_of_loc)),
+         rank_q10_03 = min_rank(desc(x= q10_03_03_overall_quality_of_trash_c)),
+         rank_q15 = min_rank(desc(x= q15_how_well_informed_do_you_believe_yo)),
+         rank_q20_03 = min_rank(desc(x= q20_03_3_enforcing_clean_up_of_trash)),
+         rank_q10_03 = min_rank(desc(x= q10_03_03_overall_quality_of_trash_c)),
+         ) %>%
+  arrange(desc(rank_q1_01)) %>%
+  relocate(TRACTCE, rank_q1_01,q1_01_1_overall_quality_of_life_in_y)
+```
+
+\newpage
+
+### Reporting Satisfaction in South Bend:
+
+For each of the following questions, the Community Survey was grouped by respondents' census tracts and an average score of each question was taken. All missing answers and "prefer not to answer" responses were removed from the data set prior to taking the average. 10 census tracts were then filtered out by lowest response, and plotted on the county map to indicate location and provide a visual cue to any geographic trends in the City.
+
+Each question was asked according to a Likert scale, where 1 = "Extremely Dissatisfied" and 5 = "Extremely Satisfied". The lower the response, the higher the tract was ranked in terms of risk.
+
+```{r, message=FALSE}
+plot_slices <- function(df = com_survey_ranked,rank_var,var) {
+  tmp_slice = com_survey_ranked %>%
+  dplyr::slice_min(rank_var, n = 10) %>%
+  sf::st_join(census)
+  p = ggplot() +
+    geom_sf(data=census$geometry_c) +
+    geom_sf(data=tmp_slice$geometry_c,aes(fill="red")) +
+    geom_sf_text(data=tmp_slice$geometry_c,label=tmp_slice$TRACTCE.x,size=2.5) +
+    coord_sf(crs = 4326, xlim = c(-86.4, -86.14), ylim = c(41.56, 41.756)) 
+  return(p)
+}
+
+```
+
+#### Q1:
+
+To better understand what regions of the city are reporting lower-than-average levels of satisfaction with the City, we evaluated several questions from the Community Survey that recorded respondents' sentiment about the city overall, as well as individual city services and resources. To begin, Question 1 was evaluated as a question to report overall quality of life in their neighborhood. For question 1, Census Tracts 19, 5 and 34 ranked lowest at scores of 2, 2.57, and 2.65, respectively.
+
+\
+\
+
+```{r, message=FALSE}
+plot_slices(com_survey_ranked$rank_q1_01,com_survey_ranked$q1_01_1_overall_quality_of_life_in_y) + 
+  ggtitle("10 Low Ranking Tracts in Community Survey",subtitle = "Q1_01: Overall Satisfaction with the City")
+```
+
+\
+
+```{r, message=FALSE}
+data.frame(com_survey_ranked) %>%
+  dplyr::select(TRACTCE,rank_q1_01,q1_01_1_overall_quality_of_life_in_y) %>%
+  slice_min(q1_01_1_overall_quality_of_life_in_y,n=10) %>%
+  knitr::kable("latex") %>%
+  kable_styling(position = "center")
+```
+
+\newpage
+
+#### Q15:
+
+Next, we look at Question 15 from the Community Survey, which asks respondents how well informed they feel with the City. From this analysis, we found that Census Tracts 117.04, 111, and 26 ranked lowest at mean scores of 2, 3, and 3.46, respectively. It is worth noting that these tracts are located outside of the downtown areas of the city, indicating that sentiments of involvement with the City decrease as you move away from the urban center.
+
+```{r, message=FALSE}
+plot_slices(com_survey_ranked$rank_q15,com_survey_ranked$q15_how_well_informed_do_you_believe_yo) + 
+  ggtitle("Low Ranking Tracts in Community Survey",subtitle = "Q15: How Well Informed do You Feel with the City?")
+```
+
+\
+
+```{r, message=FALSE}
+data.frame(com_survey_ranked) %>%
+  dplyr::select(TRACTCE,rank_q15,q15_how_well_informed_do_you_believe_yo) %>%
+  slice_min(q15_how_well_informed_do_you_believe_yo,n=10) %>%
+  knitr::kable("latex")%>%
+  kable_styling(position = "center")
+```
+
+\newpage
+
+#### Q9C:
+
+Question 9C specifically asks respondents how easy it was to have their issues addressed with the city, which provides insight into the response time, level of completion, and quality of work being experienced by residents in the City.
+
+Census Tracts 28, 24, and 1 had the three lowest responses at 2.5, 2.71, and 2.72, respectively.
+
+```{r, message=FALSE}
+
+plot_slices(com_survey_ranked$rank_q9c,com_survey_ranked$q9c_how_easy_was_it_to_address_your_iss) + 
+  ggtitle("Low Ranking Tracts in Community Survey",subtitle = "Q9C: How Easy Is It to\nHave Your Issues Addressed?")
+  
+```
+
+\
+
+```{r, message=FALSE}
+data.frame(com_survey_ranked) %>%
+  dplyr::select(TRACTCE,rank_q9c,q9c_how_easy_was_it_to_address_your_iss) %>%
+  slice_min(q9c_how_easy_was_it_to_address_your_iss,n=10) %>%
+  knitr::kable("latex")%>%
+  kable_styling(position = "center")
+```
+
+\newpage
+
+#### Q10_08:
+
+Question 10_08 records responses about residents' level of satisfaction with the enforcement of local ordinances and codes. Given that several of the most prevalent call topics are related to code enforcement topics, this indicates if there are areas of the city where these topics are more of a concern.
+
+Census tracts 5, 9, and 21 reported the lowest levels of satisfaction with Code Enforcement, with average responses of 1.857, 1.875, and 1.888, respectively. Of note, Census Tract 21 has the highest number of calls to 311 per capita, indicating high usage of 311 services but relatively low levels of satisfaction with the services received.
+
+```{r, message=FALSE}
+plot_slices(com_survey_ranked$rank_q10_08,com_survey_ranked$q10_08_08_overall_enforcement_of_loc)+ 
+  ggtitle("Low Ranking Tracts in Community Survey",subtitle = "Q10_08: Satisfaction with Enforcement of\nOrdinances and Codes")
+```
+
+\
+
+```{r, message=FALSE}
+data.frame(com_survey_ranked) %>%
+  dplyr::select(TRACTCE,rank_q10_08,q10_08_08_overall_enforcement_of_loc) %>%
+  slice_min(q10_08_08_overall_enforcement_of_loc,n=10) %>%
+  knitr::kable("latex")%>%
+  kable_styling(position = "center")
+```
+
+\
+
+#### Q10_03:
+
+Question 10_03 similarly asks about a service-specific task. Respondents are asked to rate their level of satisfaction with the quality of their trash collection service. From this question, we see that Tract 111 ranks lowest in this category, followed by 115.09. 34 also ranks lowly, along with a cluster of tracts near downtown (22, 21, 19, 20, and 6)- this could indicate that trash services experience more issues in rural areas as well as densely populated city centers, with better service being performed in areas with city infrastructure but a lwoer population density.
+
+```{r, message=FALSE}
+plot_slices(com_survey_ranked$rank_q10_03,com_survey_ranked$q10_03_03_overall_quality_of_trash_c) + 
+  ggtitle("Low Ranking Tracts in Community Survey",subtitle = "Q10_03: Overall Quality of Trash Collection")
+```
+
+\
+\
+
+```{r, message=FALSE}
+data.frame(com_survey_ranked) %>%
+  dplyr::select(TRACTCE,rank_q10_03,q10_03_03_overall_quality_of_trash_c) %>%
+  slice_min(q10_03_03_overall_quality_of_trash_c,n=10) %>%
+  knitr::kable("latex")%>%
+  kable_styling(position = "center")
+```
+
+#### Q20_3:
+
+Question 20_3 asks respondents to provide their level of satisfaction with Trash Clean-Up enforcement. Given that Litter COde Violations are very large contributor to 311 calls in general, this question will provide insight as to how these issues are being handled & perceived by residents.
+
+Census Tract 111 ranked lowest at an average score of **1**, or as low as possible. Following 111, Census Tracts 34, 25, and 117.03 all report mean satisfactions of 2 or lower. Again, it appears that the west side of downtown and more rural, large tracts are reporting higher levels of dissatisfaction with trash clean-up.
+
+```{r, message=FALSE}
+plot_slices(com_survey_ranked$rank_q20_03,com_survey_ranked$q20_03_3_enforcing_clean_up_of_trash) + 
+  ggtitle("Low Ranking Tracts in Community Survey",subtitle = "Q20_3: Enforcement of Trash Clean-Up")
+```
+
+\
+\
+
+```{r, message=FALSE}
+data.frame(com_survey_ranked) %>%
+  dplyr::select(TRACTCE,rank_q20_03,q20_03_3_enforcing_clean_up_of_trash) %>%
+  slice_min(q20_03_3_enforcing_clean_up_of_trash,n=10) %>%
+  knitr::kable("latex")%>%
+  kable_styling(position = "center")
+```
+
+\
+
+```{r, message=FALSE}
+#Q10 Ranking:
+q10_ranked = com_survey_sf %>%
+    group_by(TRACTCE) %>%
+    dplyr::summarize(ct=n(),
+              mn_var = mean(q10_10_10_overall_maintenance_of_cit,na.rm=T)) %>%
+    mutate(rank_var = min_rank(desc(mn_var))) %>%
+    arrange(desc(rank_var)) %>%
+    slice_max(rank_var,n=10) %>%
+    st_join(census)
+```
+
+```{r, message=FALSE}
+#Q1 Ranking:
+q1_01_ranked = com_survey_sf %>%
+    group_by(TRACTCE) %>%
+    dplyr::summarize(ct= n(),
+              mn_var = mean(q1_01_1_overall_quality_of_life_in_y,na.rm=T)) %>%
+    mutate(rank_var = min_rank(desc(mn_var))) %>%
+    arrange(desc(rank_var)) %>%
+    slice_max(rank_var,n=10) %>%
+    st_join(census)
+```
+
+```{r, message=FALSE}
+# Q4 Ranking:
+q4_ranked = com_survey_sf %>%
+    group_by(TRACTCE) %>%
+    dplyr::summarize(ct=n(),
+              mn_var = mean(q4_01_1_availability_of_information,na.rm=T)) %>%
+    mutate(rank_var = min_rank(desc(mn_var))) %>%
+    arrange(desc(rank_var)) %>%
+    slice_max(rank_var,n=10) %>%
+    st_join(census)
+```
+
+```{r, message=FALSE}
+#Q9 Ranked:
+q9_ranked = com_survey_sf %>%
+    group_by(TRACTCE) %>%
+    dplyr::summarize(ct=n(),mn_var = mean(q9b_did_you_contact_311,na.rm=T)) %>%
+    mutate(rank_var = min_rank(desc(mn_var))) %>%
+    arrange(desc(rank_var)) %>%
+    slice_max(rank_var,n=10) %>%
+    st_join(census)
+```
+
+```{r, message=FALSE}
+#Q10_3:
+q10_03_ranked = com_survey_sf %>%
+    group_by(TRACTCE) %>%
+    dplyr::summarize(ct=n(),mn_var = mean(q10_03_03_overall_quality_of_trash_c,na.rm=T)) %>%
+    mutate(rank_var = min_rank(desc(mn_var))) %>%
+    arrange(desc(rank_var)) %>%
+    slice_max(rank_var,n=10) %>%
+    st_join(census)
+```
+
+```{r, message=FALSE}
+# Q10_8:
+q10_08_ranked = com_survey_sf %>%
+    group_by(TRACTCE) %>%
+    dplyr::summarize(ct=n(),mn_var = mean(q10_08_08_overall_enforcement_of_loc,na.rm=T)) %>%
+    mutate(rank_var = min_rank(desc(mn_var))) %>%
+    arrange(desc(rank_var)) %>%
+    slice_max(rank_var,n=10) %>%
+    st_join(census)
+```
+
+\newpage
+
+### Correlation of Census Tracts demonstrating low satisfaction via the Community Survey
+
+Above, we evaluated the satisfaction across the City by highlighting census tracts ranking lowly across several questions in the community survey. Next, we seek to understand if there are specific census tracts that are repeatedly ranking in the bottom 5 census tracts to highlight regions that would benefit from investment across multiple services.
+
+To perform this aggregation, we summarized ranked responses from **Q1_01** (overall quality of life), **Q10_03** (Satisfaction with trash collection), **Q10_08** (Satisfaction with code enforcement), **Q10_overall** (Satisfaction with Overall maintenance of city), **Q4** (Satisfaction with Availability of Information), **Q9** (Satisfaction with Issues addressed by 311).
+
+Next, each census tract was tallied to record the number of times that the tract was found in the bottom 5 tracts. The higher the tally, the more separate categories in which the tract underperformed. From this analysis, we found that Census Tract 111 is least satisfied across the selected fields; census tracts 21, 19, and 5 were also demonstrated to be at risk, forming a small cluster of interest just west of the downtown area.
+
+This information above has also been provided in table format below.
+
+```{r, message=FALSE}
+tally_ranks <- cbind(c(q1_01_ranked$TRACTCE.x,
+      q10_03_ranked$TRACTCE.x,
+      q10_08_ranked$TRACTCE.x,
+      q10_ranked$TRACTCE.x,
+      q4_ranked$TRACTCE.x,
+      q9_ranked$TRACTCE.x)) %>%
+  as.data.frame() %>%
+  dplyr::rename("TRACTCE" = "V1") %>%
+  group_by(TRACTCE) %>%
+  tally() %>%
+  arrange(desc(n))
+
+census$TRACTCE <- as.character(census$TRACTCE)
+
+tally_sf = left_join(tally_ranks,census,by="TRACTCE") %>%
+  dplyr::select(TRACTCE, n, geometry) %>%
+  group_by(TRACTCE)
+
+ggplot(tally_sf) +
+  geom_sf(data=census$geometry_c) +
+  geom_sf(data=tally_sf$geometry,aes(fill=tally_sf$n)) +
+  geom_sf_text(data=tally_sf$geometry,label=tally_sf$n,size=2.5) +
+  theme(legend.position = "n") +
+  coord_sf(crs = 4326, xlim = c(-86.4, -86.14), ylim = c(41.56, 41.756)) +
+  scale_fill_stepsn(n.breaks = 10, colors =terrain.colors(10)) +
+  theme_minimal() +
+  theme(legend.position = "n",
+                  axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1)) +
+  ggtitle("Frequency of Census Tract in Bottom 5 \nCommunity Survey Response Rates, n=6",
+          subtitle = "Census Tract 111 (left) is least satisfied across responses")
+```
+
+```{r, message=FALSE}
+tally_df = data.frame(tally_sf) %>%
+  dplyr::select(TRACTCE,n) %>%
+  group_by(TRACTCE) %>%
+  unique()
+
+ggplot(tally_df,aes(x=reorder(TRACTCE,n),y=as.factor(n),fill=n)) +
+  geom_col() +
+  coord_flip() +
+  scale_fill_stepsn(n.breaks = 6, colors =hcl.colors(5),name="Number of Times Ranked \n In Bottom 5 Tracts") +
+  xlab("Census Tract") +
+  ylab("Count") +
+  theme_minimal() +
+  theme(legend.position = "n")+
+  ggtitle("'At Risk' Tracts, Based on Lowest Ranked Satisfaction Across City Services",
+          subtitle = "Number of Times Ranked In Bottom 5 Tracts")
+```
+
+\newpage
+
+### Calls per Capita: Investigation of 311 Topics
+
+Next, we aim to investigate 311 call prevalence across the city by first capturing the number of unique topics that are represented in the 311 call data. First, we evaluate the topic topics referenced across the city by tabulating the number of calls corresponding to organizational units within the city:
+
+\
+\
+
+```{r, message=FALSE}
+ki_sf %>%
+  dplyr::select(cosb_knowledgearticlename.x,cosb_organizationalunitname,cosb_serviceformdefinitionname,TRACTCE,geometry, geometry_c) %>%
+  group_by(cosb_organizationalunitname) %>%
+  tally() %>%
+  dplyr::filter(n >100) %>%
+  dplyr::arrange(desc(n),.by_group = TRUE) %>%
+  data.frame() %>%
+  dplyr::select(cosb_organizationalunitname,n) %>%
+  knitr::kable("latex") %>%
+  kable_styling(position = "center")
+```
+
+```{r, message=FALSE}
+ki_orgs <- ki_sf %>%
+  dplyr::select(cosb_knowledgearticlename.x,cosb_organizationalunitname,cosb_serviceformdefinitionname,TRACTCE,geometry, geometry_c) %>%
+  group_by(cosb_organizationalunitname) %>%
+  tally() %>%
+  filter(n >100) %>%
+  arrange(desc(n)) %>%
+  data.frame() %>%
+  dplyr::select(cosb_organizationalunitname,n)
+
+ggplot(ki_orgs,aes(x=reorder(cosb_organizationalunitname,n),y=n)) +
+  geom_col(aes(fill=n)) +
+  coord_flip() +
+  xlab("Organizational Unit") + 
+  ylab("Count") +
+  theme_minimal() +
+  scale_fill_stepsn(n.breaks = 8, colors =hcl.colors(8),name="") +
+  ggtitle("Distirbution of 311 Calls by Organizational Unit")
+
+```
+
+### Per-Capita Calls for Selected 311 Topics:
+
+Next, we aimed to address the variable population across the City by separating call volume by census tract and calculating calls per capita by incorporating population data gathered in the 2020 Decennial Census. From this dataset, we are able to divide the number of calls by the population of each census tract to provide a per-capita level response for each call category.
+
+```{r, message=FALSE}
+ki_downselected <- ki_sf %>%
+  dplyr::select(cosb_knowledgearticlename.x,cosb_organizationalunitname,cosb_serviceformdefinitionname,TRACTCE,geometry, geometry_c) %>%
+  group_by(TRACTCE,cosb_organizationalunitname) %>%
+  dplyr::tally() %>%
+  dplyr::filter(n >100) %>%
+  dplyr::arrange(desc(n),.by_group = TRUE)
+```
+
+```{r, message=FALSE}
+ki_down_sf <- st_join(ki_downselected,census) %>%
+  st_join(acs_demos) %>%
+  mutate(percap = n/total) %>%
+  data.frame() %>%
+  dplyr::select(TRACTCE,percap,cosb_organizationalunitname,n,geometry_c.x) %>%
+  arrange(desc(percap))
+```
+
+#### Solid Waste Calls per Capita:
+
+Solid Waste calls comprise a large percentage of the total call topics placed with 311. This category includes topics such as requesting an extra trash pickup, reporting a missed trash pick-up, yard waste pick-up requests, and general concerns. We found that Census Tract 21 has the highest number of requests per capita at .38 requests per citizen. Census tracts 113.1, 117.04, 118.03, 118.04, and 119 did not report any solid waste reports to 311.
+
+```{r, message=FALSE}
+ki_waste_pc <- ki_down_sf %>%
+  filter(cosb_organizationalunitname=="Solid Waste")
+
+
+ggplot(ki_waste_pc) + 
+  geom_sf(data=census$geometry_c) +
+  geom_sf(data=ki_waste_pc$geometry,aes(fill=ki_waste_pc$percap,alpha=.7)) +
+  coord_sf(crs = 4326, xlim = c(-86.4, -86.14), ylim = c(41.56, 41.756)) +
+  geom_sf_text(data=ki_waste_pc$geometry,label=ki_waste_pc$TRACTCE,size=2.4) +
+  scale_fill_stepsn(n.breaks = 8, colors =hcl.colors(8),name="Solid Waste Calls Per Capita") +
+  theme_minimal() +
+  theme(legend.position = "n",
+                  axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1)) +
+  ggtitle("311 Calls by Topic: Solid Waste",
+          subtitle = "West and Northwest Tracts have lower Per Capita Calls")
+
+```
+
+\newpage
+
+### Analysis of Repeat Callers
+
+##### Another area of interest in our analysis is the behavior of callers across the city and their satisfaction with how the city resolved their issues.
+
+The number of calls placed to 311 by an individual regarding the same issue over time may indicate that services were not performed satisfactorily to the residents.
+
+```{r, message=FALSE}
+ki_sf_numcall_f <- ki_sf %>%
+  filter(ki_sf$cosb_totalservicerequests > 5) %>%
+  arrange(desc(cosb_totalservicerequests))
+
+
+squeakywheel = ki_sf %>%
+  dplyr::filter(ki_sf$cosb_totalservicerequests > 5) %>%
+  group_by(TRACTCE) %>%
+  dplyr::select(TRACTCE, geometry, geometry_c, cosb_totalservicerequests) %>%
+  dplyr::mutate(mean_calls = mean(cosb_totalservicerequests),sum_calls = n()) %>%
+  dplyr::arrange(desc(mean_calls))
+```
+
+```{r, message=FALSE}
+big_streets <- getbb("South Bend Indiana United States")%>%
+  opq()%>%
+  add_osm_feature(key = "highway", 
+                  value = c("motorway", "primary", "motorway_link", "primary_link")) %>%
+  osmdata_sf()
+
+small_streets <- getbb("South Bend Indiana United States")%>%
+  opq()%>%
+  add_osm_feature(key = "highway", 
+                  value = c("residential", "living_street",
+                            "unclassified",
+                            "service", "footway"
+                  )) %>%
+  osmdata_sf()
+
+river <- getbb("South Bend Indiana United States") %>%
+  opq()%>%
+  add_osm_feature(key = "waterway", value = "river") %>%
+  osmdata_sf()
+```
+
+```{r, message=FALSE}
+squeakywheel2 = ki_sf %>%
+  filter(ki_sf$cosb_totalservicerequests > 1) %>%
+  group_by(TRACTCE) %>%
+  dplyr::select(TRACTCE, geometry, geometry_c, cosb_totalservicerequests) %>%
+  dplyr::mutate(mean_calls = mean(cosb_totalservicerequests),sum_calls = n()) %>%
+  dplyr::arrange(desc(mean_calls))
+```
+
+Here, we show the top 20 callers across the city in terms of numbers of calls placed to 311.
+
+```{r, message=FALSE}
+ki_repeat_counts = ki_sf_numcall_f %>%
+  group_by(cosb_phonecall,cosb_knowledgearticlename.x) %>%
+  dplyr::summarize(count_calls = n()) %>%
+  filter(cosb_knowledgearticlename.x != "2019 Spring ReLeaf Program") %>%
+  arrange(desc(count_calls))
+
+ki_sf_numcall_f %>%
+  group_by(cosb_phonecall) %>%
+  dplyr::summarize(count_calls = n()) %>%
+  arrange(desc(count_calls)) %>%
+  slice_max(count_calls,n=20) %>%
+  as.data.frame() %>%
+  dplyr::rename(caller_id = cosb_phonecall) %>%
+  dplyr::select(caller_id,count_calls) %>%
+  knitr::kable("latex")%>%
+  kable_styling(position = "center")
+```
+
+\
+\
+\
+
+Next, we show the most frequent topics referenced by the repeat callers. Doing so required combining several similar call topic categories into one; for example, "Grass and Weed Neighborhood Services & Enforcement Violations" were combined with "Grass and Weed Code Violation" calls. Street light issues were the most frequent topic discussed by repeat callers, followed by Grass & Weed Code Violations and Vegetation Code Violations.
+
+```{r, message=FALSE}
+ki_repeat_counts$cosb_knowledgearticlename.x[ki_repeat_counts$cosb_knowledgearticlename.x == "Grass and Weed Neighborhood Services & Enforcement Violation"] = "Grass and Weed Code Violation"
+
+ki_repeat_counts$cosb_knowledgearticlename.x[ki_repeat_counts$cosb_knowledgearticlename.x == "Litter Neighborhood Services & Enforcement Violation"] = "Litter Code Violation"
+
+ki_repeat_counts$cosb_knowledgearticlename.x[ki_repeat_counts$cosb_knowledgearticlename.x == "Structure Neighborhood Services & Enforcement  Violations"] = "Structure Code Violations"
+
+ki_repeat_counts$cosb_knowledgearticlename.x[ki_repeat_counts$cosb_knowledgearticlename.x == "Street Needs to be Plowed"] = "Street Needs Plowed"
+
+ki_repeat_counts$cosb_knowledgearticlename.x[ki_repeat_counts$cosb_knowledgearticlename.x == "Vegetation Neighborhood Services & Enforcement Violation"] = "Vegetation Code Violation"
+
+ki_repeat_counts$cosb_knowledgearticlename.x[ki_repeat_counts$cosb_knowledgearticlename.x == "Grass and Weed Neighborhood Services & Enforcement Violation"] = "Grass and Weed Code Violation"
+
+count_types = data.frame(ki_repeat_counts) %>%
+  dplyr::select(cosb_knowledgearticlename.x,count_calls) %>%
+  group_by(cosb_knowledgearticlename.x) %>%
+  filter(count_calls > 3) %>%
+  dplyr::summarize(count=n()) %>%
+  mutate(pct_calls = 100*count/sum(count)) %>%
+  arrange(desc(pct_calls))
+
+ggplot(count_types,aes(x=reorder(cosb_knowledgearticlename.x,pct_calls),y=pct_calls,fill=pct_calls)) +
+  geom_col() +
+  scale_fill_stepsn(n.breaks = 5, colors =hcl.colors(5),name="Proportion of Repeat\nCallers for Topic",) +
+  coord_flip() +
+  xlab("") +
+  ylab("% of Total") +
+  geom_text(aes(label = round(pct_calls,1), hjust = -.1)) +
+  theme_minimal() +
+  theme(legend.pos="n",
+        plot.title = element_text(hjust = 2),
+        plot.subtitle = element_text(hjust=2.8),
+        axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1))  +
+  ggtitle("Frequently Referenced 311 Topics by Repeat Callers",
+          subtitle="Filtered for n > 5 repeat calls, combined similar 311 article names") +
+  expand_limits(y = 50)
+```
+
+```{r, message=FALSE}
+squeakywheel3 = ki_sf %>%
+  filter(ki_sf$cosb_totalservicerequests > 3) %>%
+  group_by(cosb_knowledgearticlename.x) %>%
+  dplyr::select(geometry,cosb_totalservicerequests,cosb_knowledgearticlename.x) %>%
+  dplyr::summarize(num_calls_by_topic = n()) %>%
+  arrange(desc(num_calls_by_topic))
+
+
+```
+
+#### Topic-Specific Repeat Calls: Distribution across the City
+
+##### Street Light Issues
+
+In order to understand if there are geographic trends surrounding repeat caller data, we plotted the individual request locations by user-provided latitiude and longtiude. Beginning with Street Light issues, we note that there are several clussters corresponding to roads in the area. Specifically, Lincolnway, W. Ewing Street, and Sample Street are among three of the most frequently referenced city streets.
+
+```{r, message=FALSE}
+sl = squeakywheel3 %>% filter(cosb_knowledgearticlename.x == "Street Light Issue")
+ggplot() +
+  geom_sf(data=census$geometry_c) +
+  geom_sf(data=sl$geometry,color=sl$num_calls_by_topic,size=1,alpha=.5) +
+  geom_sf(data = big_streets$osm_lines,
+          inherit.aes = FALSE,
+          color = "black",
+          alpha=.05) +
+  geom_sf(data = small_streets$osm_lines,
+          inherit.aes = FALSE,
+          color = "black",
+          alpha=.04) +
+  geom_sf(data = river$osm_lines,
+          inherit.aes = FALSE,
+          color = "blue",
+          alpha=.5) +
+  coord_sf(crs = 4326, xlim = c(-86.35, -86.18), ylim = c(41.6, 41.756)) +
+  ggtitle("Street Light Issue: Repeat 311 Callers in the City") +
+  geom_sf_text(data=census$geometry_c,label=census$TRACTCE,size=2.4) 
+
+```
+
+We provide a closer view at the focus areas below:
+
+```{r, message=FALSE}
+ggplot() +
+  geom_sf(data=census$geometry_c) +
+  geom_sf(data=sl$geometry,color="red",size=1,alpha=.2) +
+  geom_sf(data = big_streets$osm_lines,
+          inherit.aes = FALSE,
+          color = "black",
+          alpha=.1) +
+  geom_sf(data = small_streets$osm_lines,
+          inherit.aes = FALSE,
+          color = "black",
+          alpha=.05) +
+  geom_sf(data = river$osm_lines,
+          inherit.aes = FALSE,
+          color = "blue",
+          alpha=.1) +
+  coord_sf(crs = 4326, xlim = c(-86.29, -86.23), ylim = c(41.645, 41.695)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1)) +
+  ggtitle("Zoomed-in View of Street Light Repeat Caller Locations") +
+  geom_sf_text(data=census$geometry_c,label=census$TRACTCE,size=2.5) 
+```
+
+```{r, message=FALSE}
+repeats = (data.frame(ki_sf)) %>%
+  dplyr::filter(cosb_totalservicerequests > 5) %>%
+  group_by(TRACTCE,cosb_knowledgearticlename.x) %>%
+  dplyr::summarize(geometry_c = st_union(geometry_c), count = n()) %>%
+  dplyr::filter(count > 5)
+
+street_repeats = repeats %>%
+  filter(cosb_knowledgearticlename.x == "Street Light Issue")
+
+ggplot() +
+  geom_sf(data=census$geometry_c) +
+  geom_sf(data=street_repeats$geometry_c,aes(fill=street_repeats$count,alpha=.2)) +
+  coord_sf(crs = 4326, xlim = c(-86.35, -86.18), ylim = c(41.6, 41.756)) +
+  theme_minimal() +
+  scale_fill_stepsn(n.breaks = 5, colors =hcl.colors(5),name="# Repeat Callers\nin Tract") +
+  ggtitle("Repeat Callers: Street Light Issues",
+          subtitle = "Filtered to Callers with > 5 Repeat Calls") +
+  guides(alpha="none",size="none") +
+  geom_sf_text(data=street_repeats$geometry_c,label=street_repeats$TRACTCE,size=2.4) 
+
+
+ggplot(street_repeats,aes(x=reorder(TRACTCE,count),y=count,fill=count)) +
+  geom_col() +
+  scale_fill_stepsn(n.breaks = 5, colors =hcl.colors(5),name="# Repeat Callers\nfor Topic") +
+  theme_minimal() +
+  xlab("Census Tract") +
+  ylab("# Repeat Callers") +
+  coord_flip()
+
+```
+
+##### Grass & Weed Code Violations:
+
+A similar analysis was performed for grass and weed code violations. It was noticed that the 311 call topic changed from "Grass and Weed Code Violation" to "Grass and Weed Neighborhood Services" through the history of the 311 calls; both topics were merged for completeness.
+
+First, we plotted each individual location by caller to understand the call locations and appreciate any clusters geographically.
+
+```{r, message=FALSE}
+sl = squeakywheel3 %>% filter(cosb_knowledgearticlename.x == "Grass and Weed Code Violation" | cosb_knowledgearticlename.x == "Grass and Weed Neighborhood Services & Enforcement Violation")
+ggplot() +
+  geom_sf(data=census$geometry_c) +
+  geom_sf(data=sl$geometry,color="purple",size=1,alpha=.5) +
+  geom_sf(data = big_streets$osm_lines,
+          inherit.aes = FALSE,
+          color = "black",
+          alpha=.05) +
+  geom_sf(data = small_streets$osm_lines,
+          inherit.aes = FALSE,
+          color = "black",
+          alpha=.04) +
+  geom_sf(data = river$osm_lines,
+          inherit.aes = FALSE,
+          color = "blue",
+          alpha=.5) +
+  coord_sf(crs = 4326, xlim = c(-86.35, -86.18), ylim = c(41.6, 41.756)) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1)) +
+  geom_sf_text(data=census$geometry_c,label=census$TRACTCE,size=2.5,alpha=.7) +
+  ggtitle("Grass & Weed Code Violations:\nLocation of Repeat Callers in the City")
+```
+
+Next, we aggregated the calls by Census Tract to evaluate call frequency as a trend across a larger area. From this analysis, we found that census tracts 4, 6, amd 20 were the tracts with the highest number of repeat callers; this region of the city just west of downtown had shown in prior analyses to be a hotspot for low community response scores, which makes the necessity for repeat calls to 311 for adequate service an interesting observation.
+
+```{r, message=FALSE}
+grass_repeats = repeats %>%
+  filter(cosb_knowledgearticlename.x == "Grass and Weed Code Violation" | cosb_knowledgearticlename.x == "Grass and Weed Neighborhood Services & Enforcement Violation")
+
+ggplot() +
+  geom_sf(data=census$geometry_c) +
+  geom_sf(data=grass_repeats$geometry_c,aes(fill=grass_repeats$count,alpha=.2)) +
+  coord_sf(crs = 4326, xlim = c(-86.35, -86.18), ylim = c(41.6, 41.756)) +
+  theme(legend.position = "n") +
+  coord_sf(crs = 4326, xlim = c(-86.35, -86.18), ylim = c(41.6, 41.756)) +
+  geom_sf_text(data=grass_repeats$geometry_c,label=grass_repeats$TRACTCE,size=2.4) +
+  theme_minimal() +
+  scale_fill_stepsn(n.breaks = 12, colors =hcl.colors(12),name="# Repeat Callers\nfor Topic") +
+  ggtitle("Repeat Callers: Grass & Weed Code Violations",
+          subtitle = "Filtered to Callers with > 5 Repeat Calls") +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1)) +
+  guides(color="none",alpha="none",size="none")
+
+ggplot(grass_repeats,aes(x=reorder(TRACTCE,count),y=count,fill=count)) +
+  geom_col() +
+  ggtitle("Repeat Callers: Grass & Weed Code Violations") +
+  scale_fill_stepsn(n.breaks = 12, colors =hcl.colors(12),name="# Repeat Callers\nfor Topic") +
+  theme_minimal() +
+  xlab("Census Tract") +
+  ylab("# Repeat Callers") +
+  coord_flip()
+
+
+```
+
+##### Litter Neighborhood Servies & Enforcement Violations: Repeat Callers
+
+As the topic most frequently referenced in 311 calls overall, it was unsurprising to see a high number of repeat callers for this topic. We explored this data on the individual observation level by plotting occurrences across the City:
+
+```{r, message=FALSE}
+sl = squeakywheel3 %>% filter(cosb_knowledgearticlename.x == "Litter Code Violation")
+ggplot() +
+  geom_sf(data=census$geometry_c) +
+  geom_sf(data = big_streets$osm_lines,
+          inherit.aes = FALSE,
+          color = "black",
+          alpha=.05) +
+  geom_sf(data = small_streets$osm_lines,
+          inherit.aes = FALSE,
+          color = "black",
+          alpha=.04) +
+  geom_sf(data = river$osm_lines,
+          inherit.aes = FALSE,
+          color = "blue",
+          alpha=.5) +
+  theme(axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1)) +
+  geom_sf(data=sl$geometry,size=1,alpha=.2,color="deeppink4") +
+  coord_sf(crs = 4326, xlim = c(-86.35, -86.18), ylim = c(41.6, 41.756)) +
+  geom_sf_text(data=census$geometry_c,label=census$TRACTCE,size=2.5) +
+  ggtitle("Litter Neighborhood Services & Enforcement Violations:\nLocation of Repeat Callers in the City")
+
+```
+
+Next, each call was aggregated on the census tract level to track general geographic trends. Census Tract 31 ranked highest for number of litter-related repeat callers, followed by tracts 6 and 15, located adjacent to one another slighly northwest of downtown.
+
+```{r, message=FALSE, warning=FALSE}
+
+litter_repeats = repeats %>%
+  filter(cosb_knowledgearticlename.x == "Litter Neighborhood Services & Enforcement Violation" | cosb_knowledgearticlename.x == "Litter Code Violation")
+
+ggplot() +
+  geom_sf(data=census$geometry_c) +
+  geom_sf(data=litter_repeats$geometry_c,aes(fill=litter_repeats$count,alpha=.2)) +
+  theme(legend.position = "n",axis.text.x = element_text(angle = 45, vjust = 0.9, hjust=1)) +
+  coord_sf(crs = 4326, xlim = c(-86.35, -86.18), ylim = c(41.6, 41.756)) +
+  geom_sf_text(data=litter_repeats$geometry_c,label=litter_repeats$TRACTCE,size=2.4,alpha=.7) +
+  theme_minimal() +
+  scale_fill_stepsn(n.breaks = 12, colors =hcl.colors(12),name="# Repeat Callers\nfor Litter Services") +
+  ggtitle("Repeat Callers: Litter Code Violations",
+          subtitle = "Filtered to Callers with > 5 Repeat Calls") +
+  guides(color="none",alpha="none",size="none")
+
+ggplot(litter_repeats,aes(x=reorder(TRACTCE,count),y=count,fill=count)) +
+  geom_col() +
+  scale_fill_stepsn(n.breaks = 5, colors =hcl.colors(5),name="# Repeat Callers\nfor Topic") +
+  theme_minimal() +
+  xlab("Census Tract") +
+  ylab("# Repeat Callers") +
+  ggtitle("Number of Repeat Callers associated with Litter Neighborhood Services\nAnd Enforcement Violations:",
+          subtitle="Census Tract 31 shows 14 repeat callers") + coord_flip()
+
+
+```
+
+#### Repeat Callers: Correlating Satisfaction Level across Tracts of Interest
+
+Next, we aimed to incorporate the Community Survey data into the Repeat Callers analysis to understand if tracts identified in the previous three sections are satisfied with the ease of contacting the city & having their addresses addressed. Below, we have included tracts 4,6,20,30,13,3.02,7,31,26,24,15,34,27,17,12, and 11- all having ranked the highest in repeat callers above- and calculated their mean response for question 9C of the community survey ("How Easy was it to Address Your Issue?), given that a respondent had answered"Yes" to having contacted 311 in the past year. The data showing distributions of the response to Q9B ("Have you contacted 311 in the past year?") is indicated below geographically as well as by overall count. Compared to the city average response for Q9C of 3.54, 9 out of the 16 tracts of interest ranked lower than the city average.
+
+```{r, message=FALSE}
+TOI = c(4,6,20,30,13,3.02,7,31,26,24,15,34,27,17,12,11)
+repeat_cs <- com_survey_sf %>%
+  dplyr::select(q9a_how_did_you_contact_the_city,q9b_did_you_contact_311,q9c_how_easy_was_it_to_address_your_iss,
+         TRACTCE, geometry_c) %>%
+  filter(TRACTCE %in% TOI) %>%
+  group_by(TRACTCE) %>%
+  dplyr::summarize(mn = mean(q9c_how_easy_was_it_to_address_your_iss,na.rm = T)) %>%
+  arrange((mn))
+
+
+```
+
+```{r, message=FALSE}
+ggplot(repeat_cs,aes(x=reorder(TRACTCE,-mn), y =mn, fill=TRACTCE)) +
+  stat_summary(fun.y=mean, geom="point", shape=23, size=4) +
+  geom_hline(yintercept =mean(na.omit(com_survey_sf$q9c_how_easy_was_it_to_address_your_iss)),label="F" ) +
+  theme_minimal() +
+  annotate("text", x=1, y=.1+mean(na.omit(com_survey_sf$q9c_how_easy_was_it_to_address_your_iss)), label=round(mean(na.omit(com_survey_sf$q9c_how_easy_was_it_to_address_your_iss)),2), size=4, color="black") +
+  xlab("Census Tract") + 
+  ylab("Q9C Response (1 - 5)") +
+  ggtitle("Correlation Between Q9C and Districts w/ Repeat Callers", subtitle = "Community Survey 2022 Q9C: How Easy Was it to Address Your Issue with the City?\n\n1 = Very Difficult; 5 = Very Easy")
+
+```
+
+```{r, message=FALSE}
+
+q9b <- com_survey_sf %>%
+  dplyr::select(q9a_how_did_you_contact_the_city,q9b_did_you_contact_311,q9c_how_easy_was_it_to_address_your_iss,
+         TRACTCE, geometry_c) %>%
+  mutate_at(c('q9b_did_you_contact_311'), ~replace_na(.,1)) %>%
+  group_by(TRACTCE) %>%
+  dplyr::summarize(geometry_c = st_union(geometry_c), prop = 100* ((sum(q9b_did_you_contact_311)/n()))-100) %>%
+  arrange(prop)
+
+ggplot(ki_waste_pc) + 
+  geom_sf(data=census$geometry_c) +
+  geom_sf(data=q9b$geometry_c,aes(fill= q9b$prop,alpha=.5)) +
+  scale_fill_stepsn(n.breaks = 6, colors =hcl.colors(6),name="Percent") +
+  scale_alpha(guide = 'none')+
+  coord_sf(crs = 4326, xlim = c(-86.4, -86.14), ylim = c(41.56, 41.756)) +
+  geom_sf_text(data=q9b$geometry_c,label=q9b$TRACTCE,size=2.4,alpha=.7) +
+  ggtitle("Community Survey Q9B: 311 Usage in the Past Year",
+          subtitle="Percentage of respondents by Census Tract who have contacted 311:")
+
+```
+
+
+# Demographic Disparities in City Experience
+
+Below displays the some of the demographic information provided by the American Community Survey by Census Tract. The toggle to the right filters the plots to examine demographic information by a particular Census Tract.
+
+
+```{r, echo=FALSE, warning=FALSE}
+fig <- plot_ly(age,
+               x = ~Age,
+               y = ~Percent,
+               type = "bar",
+               hovertemplate = "Percent: %{y} <extra></extra>",
+               marker = list(color = "#440154"),
+               transforms = list(
+                 list(
+                   type = 'filter',
+                  target = ~CensusTract,
+                 operation = '=',
+                 value = unique(age$CensusTract)[1]
+                 )
+               )) 
+
+annot <- list(list(text = "Census<br>Tract",
+                   x=0.97, y=1.1,
+                   xref='paper', yref='paper',
+                   showarrow=FALSE))
+
+fig <- fig %>% layout(title = "Age by Census Tract",
+                      xaxis = list(list(type = "category"), title = ""),
+                      updatemenus = list(
+                        list(type = 'dropdown',
+                             active = 0,
+                             x = 1.15,
+                             y = 1.1,
+                             buttons = apply(as.data.frame(unique(age$CensusTract)), 1,
+                                             function(x) list(method = 'restyle',
+                                                              args = list('transforms[0].value',x),
+                                                              label = x)))),
+                      annotations = annot) %>% hide_colorbar()
+
+fig
+```
+
+```{r, echo=FALSE, warning=FALSE}
+fig <- plot_ly(sex,
+               x = ~Sex,
+               y = ~Percent,
+               type = "bar",
+               hovertemplate = "Percent: %{y} <extra></extra>",
+               marker = list(color = "#414487"),
+               transforms = list(
+                 list(
+                   type = 'filter',
+                  target = ~CensusTract,
+                 operation = '=',
+                 value = unique(sex$CensusTract)[1]
+                 )
+               )) 
+
+annot <- list(list(text = "Census<br>Tract",
+                   x=0.97, y=1.1,
+                   xref='paper', yref='paper',
+                   showarrow=FALSE))
+
+fig <- fig %>% layout(title = "Sex by Census Tract",
+                      xaxis = list(list(type = "category"), title = ""),
+                      updatemenus = list(
+                        list(type = 'dropdown',
+                             active = 0,
+                             x = 1.15,
+                             y = 1.1,
+                             buttons = apply(as.data.frame(unique(sex$CensusTract)), 1,
+                                             function(x) list(method = 'restyle',
+                                                              args = list('transforms[0].value',x),
+                                                              label = x)))),
+                      annotations = annot) %>% hide_colorbar()
+
+fig
+```
+
+```{r, echo=FALSE, warning=FALSE}
+fig <- plot_ly(race,
+               x = ~race,
+               y = ~Percent,
+               type = "bar",
+               marker = list(color = "#2a788e"),
+               hovertemplate = "Percent: %{y} <extra></extra>",
+               transforms = list(
+                 list(
+                   type = 'filter',
+                  target = ~Census_Tract,
+                 operation = '=',
+                 value = unique(race$Census_Tract)[1]
+                 )
+               )) 
+
+annot <- list(list(text = "Census<br>Tract",
+                   x=0.97, y=1.1,
+                   xref='paper', yref='paper',
+                   showarrow=FALSE))
+
+fig <- fig %>% layout(title = "Race/Ethnicity by Census Tract",
+                      xaxis = list(list(type = "category"), title = ""),
+                      updatemenus = list(
+                        list(type = 'dropdown',
+                             active = 0,
+                             x = 1.15,
+                             y = 1.1,
+                             buttons = apply(as.data.frame(unique(race$Census_Tract)), 1,
+                                             function(x) list(method = 'restyle',
+                                                              args = list('transforms[0].value',x),
+                                                              label = x)))),
+                      annotations = annot) %>% hide_colorbar()
+
+fig
+```
+
+```{r, echo=FALSE, warning=FALSE}
+fig <- plot_ly(education_over_25,
+               x = ~Education,
+               y = ~Percent,
+               type = "bar",
+               marker = list(color = "#22a884"),
+               hovertemplate = "Percent: %{y} <extra></extra>",
+               transforms = list(
+                 list(
+                   type = 'filter',
+                  target = ~CensusTract,
+                 operation = '=',
+                 value = unique(education_over_25$CensusTract)[1]
+                 )
+               )) 
+
+annot <- list(list(text = "Census<br>Tract",
+                   x=1.15, y=1,
+                   xref='paper', yref='paper',
+                   showarrow=FALSE))
+
+fig <- fig %>% layout(title = "Education Level by Census Tract (Over Age 25)",
+                      xaxis = list(list(type = "category"), title = ""),
+                      updatemenus = list(
+                        list(type = 'dropdown',
+                             active = 0,
+                             x = 1.35,
+                             y = 1,
+                             buttons = apply(as.data.frame(unique(education_over_25$CensusTract)), 1,
+                                             function(x) list(method = 'restyle',
+                                                              args = list('transforms[0].value',x),
+                                                              label = x)))),
+                      annotations = annot) %>% hide_colorbar()
+
+fig
+```
+
+```{r, echo=FALSE, warning=FALSE}
+fig <- plot_ly(income_over_15,
+               x = ~Income,
+               y = ~Percent,
+               type = "bar",
+               marker = list(color = "#7ad151"),
+               hovertemplate = "Percent: %{y} <extra></extra>",
+               transforms = list(
+                 list(
+                   type = 'filter',
+                  target = ~CensusTract,
+                 operation = '=',
+                 value = unique(income_over_15$CensusTract)[1]
+                 )
+               )) 
+
+annot <- list(list(text = "Census<br>Tract",
+                   x=0.97, y=1,
+                   xref='paper', yref='paper',
+                   showarrow=FALSE))
+
+fig <- fig %>% layout(title = "Income Level by Census Tract (Over Age 15)",
+                      xaxis = list(list(type = "category"), title = ""),
+                      updatemenus = list(
+                        list(type = 'dropdown',
+                             active = 0,
+                             x = 1.15,
+                             y = 1,
+                             buttons = apply(as.data.frame(unique(income_over_15$CensusTract)), 1,
+                                             function(x) list(method = 'restyle',
+                                                              args = list('transforms[0].value',x),
+                                                              label = x)))),
+                      annotations = annot) %>% hide_colorbar()
+
+fig
+```
+
+### Identifying the Least Satisfied Census Tracts
+
+We identified the least satisfied census tracts by looking at the community survey responses and finding the tracts with the lowest average response to the question asking residents to rate the overall quality of life in their community. We excluded census tracts with fewer than five responses to the community survey and the results can be seen here:
+
+```{r}
+least_sat = data.frame(Satisfaction2022[Satisfaction2022$TotalResponses > 4,])
+least_sat$TRACTCE = least_sat$TRACTCE / 100
+least_sat$TRACTCE <- str_replace(as.character(least_sat$TRACTCE), ".00", "")
+
+least_sat_output = least_sat %>% 
+  dplyr::select(TRACTCE, OverallAvgSatisfaction) %>% 
+  arrange(OverallAvgSatisfaction, desc=F) %>%
+  dplyr::rename("Census Tract" = TRACTCE,
+                "Average Quality of Life Rating" = OverallAvgSatisfaction)
+kable(least_sat_output[1:5,]) %>%
+  kable_styling(position = "center")
+```
+
+The demographics of these five least satisfied census tracts will be used for comparison to the overall demographics of South Bend to see if there are any glaring differences.
+
+### Disparaties in Race in Least Satisfied Census Tracts
+
+```{r}
+race_tidy = pivot_wider(race, id_cols = Census_Tract, names_from = race, values_from = Percent)
+race_tidy$TRACTCE <- str_replace(as.character(race_tidy$Census_Tract), ".00", "")
+names(race_tidy) = str_trim(names(race_tidy))
+
+
+
+df_merged = merge(race_tidy, least_sat, by='TRACTCE')
+pops$TRACTCE = pops$Census_Tract
+df_merged = merge(df_merged, pops, by='TRACTCE')
+```
+
+```{r}
+#OVERALL SOUTH BEND:
+#White alone, percent: 58.1%
+#Black or African American alone, percent(a): 25.2%
+#American Indian and Alaska Native alone, percent(a)	0.5%
+#Asian alone, percent(a): 2.0%
+#Native Hawaiian and Other Pacific Islander alone, percent(a): 0.0%
+#Two or More Races, percent:	8.6%
+south_bend_race = c(58.1, 25.2, 0.5, 2, 0, 8.6, 5.6)
+```
+
+```{r}
+df_merged$White_Pop = (df_merged$White / 100) * df_merged$Population
+df_merged$Black_Pop = (df_merged$'Black or African American' / 100) * df_merged$Population
+df_merged$Indian_Pop = (df_merged$'American Indian and Alaska Native' / 100) * df_merged$Population
+df_merged$Asian_Pop = (df_merged$Asian / 100) * df_merged$Population
+df_merged$Hawaiian_Pop = (df_merged$`Native Hawaiian and Other Pacific Islander` / 100) * df_merged$Population
+df_merged$Mixed_Pop = (df_merged$`Two or more races` / 100) * df_merged$Population
+
+pop_sum =  df_merged[order(df_merged$OverallAvgSatisfaction, decreasing = F),][1:5,] %>% 
+  summarise(white_pop_percent = sum(White_Pop) / sum(Population), 
+                      black_pop_percent = sum(Black_Pop) / sum(Population), 
+                      indian_pop_percent = sum(Indian_Pop) / sum(Population), 
+                      asian_pop_percent = sum(Asian_Pop) / sum(Population), 
+                      hawaiian_pop_percent = sum(Hawaiian_Pop) / sum(Population), 
+                      mixed_pop_percent = sum(Mixed_Pop) / sum(Population))
+```
+
+```{r}
+labels = c("White", "Black or African American", 
+           "American Indian and Alaska Native", 
+           "Asian", "Native Hawaiian and Other Pacific Islander",
+           "Two or More Races", "Other")
+
+least_satisfied_race_props = round(as.numeric(as.vector(pop_sum[1,]*100)), 1)
+least_satisfied_race_props = c(least_satisfied_race_props, 
+                               100 - sum(least_satisfied_race_props))
+difference = round(least_satisfied_race_props - south_bend_race, 1)
+
+
+race_props_df = data.frame(labels, south_bend_race, 
+                           least_satisfied_race_props, difference)
+names(race_props_df) = c("Race", "All of South Bend (%)", 
+                         "% in Most Dissatisfied Tracts", "Difference")
+
+kable(race_props_df) %>%
+  kable_styling(position = "center")
+```
+
+Looking at the table of race proportions in all of South Bend, compared to the least satisfied census tracts, there are some major differences. There is a large difference in the White population, with 23.5% less in the least satisfied census tracts. Conversely, there is a much higher proportion of Black or African American and Mixed Race residents.
+
+### Disparaties in Ethnicity in Least Satisfied Census Tracts
+
+```{r}
+ethnicity_tidy = pivot_wider(ethnicity, id_cols = Census_Tract, names_from = ethnicity, values_from = Percent)
+ethnicity_tidy$TRACTCE = str_replace(ethnicity_tidy$Census_Tract, ".00", "")
+names(ethnicity_tidy) = str_trim(names(ethnicity_tidy))
+
+df_merged = merge(ethnicity_tidy, least_sat, by='TRACTCE')
+pops$TRACTCE = pops$Census_Tract
+df_merged = merge(df_merged, pops, by='TRACTCE')
+
+df_merged$Hispanic_Pop = (df_merged$`Hispanic or Latino origin (of any race)` / 100) * df_merged$Population
+
+
+pop_sum =  df_merged[order(df_merged$OverallAvgSatisfaction, decreasing = F),][1:5,] %>% 
+  summarise(Hispanic_Pop_percent = sum(Hispanic_Pop) / sum(Population))
+```
+
+```{r}
+#OVERALL SOUTH BEND:
+## Hispanic or Latino, percent(b): 5.8%
+## White alone, not Hispanic or Latino, percent: 52.0%
+south_bend_ethnicity = c(5.8)
+```
+
+```{r}
+labels = c("Hispanic or Latino origin (of any race)")
+
+least_satisfied_ethnicity_props = round(as.numeric(as.vector(pop_sum[1,]*100)), 1)
+difference = round(least_satisfied_ethnicity_props - south_bend_ethnicity, 1)
+
+
+ethnicity_props_df = data.frame(labels, south_bend_ethnicity, 
+                           least_satisfied_ethnicity_props, difference)
+names(ethnicity_props_df) = c("Ethnicity", "All of South Bend (%)", 
+                         "% in Most Dissatisfied Tracts", "Difference")
+
+kable(ethnicity_props_df) %>%
+  kable_styling(position = "center")
+```
+
+Similar to the race demographics, when looking at the Hispanic/Latino population, we can see a much larger population concentrated in the least satisfied census tracts when compared to the entirety of South Bend. The difference is nearly 20%.
+
+### Disparaties in Poverty in Least Satisfied Census Tracts
+
+```{r}
+poverty_tidy = pivot_wider(poverty_status, id_cols = Census_Tract, 
+                           names_from = poverty_status, values_from = Percent)
+poverty_tidy$TRACTCE <- str_replace(as.character(poverty_tidy$Census_Tract), ".00", "")
+names(poverty_tidy) = str_trim(names(poverty_tidy))
+
+
+df_merged = merge(poverty_tidy, least_sat, by='TRACTCE')
+pops$TRACTCE = pops$Census_Tract
+df_merged = merge(df_merged, pops, by='TRACTCE')
+
+
+
+df_merged$Below100_Pop = (df_merged$Below_100_percent_of_the_poverty_level / 100) * df_merged$Population
+df_merged$At100to119_Pop = (df_merged$At_100_to_149_percent_of_the_poverty_level / 100) * df_merged$Population
+df_merged$Above150_Pop = (df_merged$At_or_above_150_percent_of_the_poverty_level / 100) * df_merged$Population
+
+
+
+pop_sum =  df_merged[order(df_merged$OverallAvgSatisfaction, decreasing = F),][1:5,] %>% 
+  summarise(Below100_Pop_percent = sum(Below100_Pop) / sum(Population), 
+                      At100to119_Pop_percent = sum(At100to119_Pop) / sum(Population), 
+                      Above150_Pop_percent = sum(Above150_Pop) / sum(Population))
+```
+
+```{r}
+# South Bend Poverty Status Population Counts
+## TotalPopulation:	102153
+## Under .50	11362
+## .50 to .74	6024
+## .75 to .99	4432
+## 1.00 to 1.24	7462
+## 1.25 to 1.49	4605
+## 1.50 to 1.74	3613
+## 1.75 to 1.84	1605
+## 1.85 to 1.99	3361
+## 2.00 to 2.99	22515
+## 3.00 to 3.99	12482
+## 4.00 to 4.99	6532
+## 5.00 and over	18160
+south_bend_poverty = (c(11362 + 6024 + 4432, 7462 + 4605,
+                        3613 + 1605 + 3361 + 22515 + 12482 + 6532 + 18160) 
+                      / 102153) * 100
+```
+
+```{r}
+labels = c("Below 100%", "100 to 149%", 
+           "150% or above")
+
+least_satisfied_poverty_props = round(as.numeric(as.vector(pop_sum[1,]*100)), 1)
+difference = round(least_satisfied_poverty_props - south_bend_poverty, 1)
+
+
+poverty_props_df = data.frame(labels, round(south_bend_poverty,1), 
+                           least_satisfied_poverty_props, difference)
+names(poverty_props_df) = c("Poverty Status (Relative to Poverty Line)", "All of South Bend (%)", 
+                         "% in Most Dissatisfied Tracts", "Difference")
+
+kable(poverty_props_df) %>%
+  kable_styling(position = "center")
+```
+
+Looking at the table on poverty status, we can see that the least satisfied census tracts have a much higher proportion of people below the poverty line, as well as a larger portion at 100 to 149% of the poverty line. Additionally, there is roughly 22% less residents that are 150% or more above the poverty line in the least satisfied census tracts compared to the whole of South Bend.
+
+### Disparaties in Age in Least Satisfied Census Tracts
+
+```{r}
+age_tidy = pivot_wider(age, id_cols = CensusTract, 
+                           names_from = Age, values_from = Percent)
+age_tidy$TRACTCE <- str_replace(as.character(age_tidy$CensusTract), ".00", "")
+names(age_tidy) = str_trim(names(age_tidy))
+
+
+df_merged = merge(age_tidy, least_sat, by='TRACTCE')
+pops$TRACTCE = pops$Census_Tract
+df_merged = merge(df_merged, pops, by='TRACTCE')
+
+
+df_merged$Under5_Pop = (df_merged$"Under 5 years" / 100) * df_merged$Population
+df_merged$From15to17_Pop = (df_merged$"5 to 17 years" / 100) * df_merged$Population
+df_merged$From18to24_Pop = (df_merged$"18 to 24 years" / 100) * df_merged$Population
+df_merged$From25to44_Pop = (df_merged$"25 to 44 years" / 100) * df_merged$Population
+df_merged$From45to54_Pop = (df_merged$"45 to 54 years" / 100) * df_merged$Population
+df_merged$From55to64_Pop = (df_merged$"55 to 64 years" / 100) * df_merged$Population
+df_merged$From65to74_Pop = (df_merged$"65 to 74 years" / 100) * df_merged$Population
+df_merged$Over75_Pop = (df_merged$"75 years and over" / 100) * df_merged$Population
+
+
+
+pop_sum =  df_merged[order(df_merged$OverallAvgSatisfaction, decreasing = F),][1:5,] %>% 
+  summarise(Under5_Pop_percent = sum(Under5_Pop) / sum(Population), 
+            From15to17_Pop_percent = sum(From15to17_Pop) / sum(Population),
+            From18to24_Pop_percent = sum(From18to24_Pop) / sum(Population),
+            From25to44_Pop_percent = sum(From25to44_Pop) / sum(Population),
+            From45to54_Pop_percent = sum(From45to54_Pop) / sum(Population),
+            From55to64_Pop_percent = sum(From55to64_Pop) / sum(Population),
+            From65to74_Pop_percent = sum(From65to74_Pop) / sum(Population),
+            Over75_Pop_percent = sum(Over75_Pop) / sum(Population)
+                      )
+
+```
+
+```{r}
+# South Bend age Status Population Counts
+## Total Population:	102153
+## Under 5 years	7216
+## 5 to 9 years	7717
+## 10 to 14 years	8003
+## 15 to 17 years	4669
+## 18 to 24 years	9962
+## 25 to 29 years	7926
+## 30 to 34 years	7351
+## 35 to 39 years	6605
+## 40 to 44 years	6515
+## 45 to 49 years	5995
+## 50 to 54 years	5870
+## 55 to 59 years	4649
+## 60 to 64 years	5966
+## 65 to 69 years	5496
+## 70 to 74 years	3100
+## 75 to 79 years	1969
+## 80 to 84 years	1418
+## 85 years and over	2359
+
+
+## Binned into the following groups:
+## Under 5 years                              
+## 5 to 17 years                             
+## 18 to 24 years                             
+## 25 to 44 years                            
+## 45 to 54 years                             
+## 55 to 64 years                            
+## 65 to 74 years                             
+## 75 years and over 
+south_bend_age = (c(7216,
+                    7717 + 8003 + 4669,
+                    9962,
+                    7926 + 7351 + 6605 + 6515,
+                    5995 + 5870,
+                    4649 + 5966,
+                    5496 + 3100,
+                    1969 + 1418 +2359) / 102153) * 100
+
+```
+
+```{r}
+labels = c("Under 5 years", "5 to 17 years", "18 to 24 years", "25 to 44 years",
+           "45 to 54 years", "55 to 64 years", "65 to 74 years", 
+           "75 years and over" )
+
+least_satisfied_age_props = round(as.numeric(as.vector(pop_sum[1,]*100)), 1)
+difference = round(least_satisfied_age_props - south_bend_age, 1)
+
+
+age_props_df = data.frame(labels, round(south_bend_age,1), 
+                           least_satisfied_age_props, difference)
+names(age_props_df) = c("Age", "All of South Bend (%)", 
+                         "% in Most Dissatisfied Tracts", "Difference")
+
+kable(age_props_df) %>%
+  kable_styling(position = "center")
+```
+
+Age is the first demographic where we do not see any significant differences in the proportions between the least satisfied and all of South Bend. This lack of notable differences could just be due to the granularity in the levels of age, and it is possible that if we made some larger age ranges with fewer groups then we would see larger gaps. The largest difference we can observe is in the 5 to 17 year old age group, with the least satisfied census tracts having about 5% more than the South Bend population.
+
+### Summarizing Demographic Disparities in Satisfaction
+
+There are still more demographics we could explore, but there were some clear insights from the few we checked out here. Further analysis may have additional findings to further support what we found here, but for the scope of our work we wanted to focus in on some of these key demographics of interest. While residents' age did not seem to show any significant relationship with satisfaction, some of the other demographics showed significant differences in population proportions. To summarize, we found that the least satisfied census tracts had a much lower White population, with significantly higher Black or African American and Hispanic/Latino populations. There are far larger percentages of residents living in poverty, and far less residents living far above the poverty line in the least satisfied areas. From our analysis, it is impossible to determine causation and say what is truly causing the residents of these tracts to be dissatisfied, so we cannot attribute it to any one thing or any specific demographics. However, it is interesting to build more of a complete profile and see some of the commonalities between the census tracts that are unhappy with their quality of life. This can help the city of South Bend ideally better serve particular communities and understand the demographics and shared traits of the unhappy residents. There is much deeper analysis and insights that could be driven from this topic, but this is a good starting point to uncover the demographic disparities in satisfaction with the city.
+
+# City Investment Preferences
+
+In this section we will explore the intersection of 2022 South Bend 311 call volume by topic, resident satisfaction as expressed through the 2022 South Bend Community Survey, and resident desired city focuses and investment preferences also as expressed through the 2022 South Bend Community Survey.
+
+In this section we chose to focus in on only information from 2022 across both the 311 calls data and the South Bend Community Survey as this was the most recent year of South Bend Community Survey survey data, and thus reflected the most recent resident satisfaction and investment preferences. We choose not to include past years' South Bend Community Survey results as those results may have been representative of what residents wanted in the past and their inclusion in this section may not reflect efforts the city had already taken to address those previous resident concerns.
+
+### 311 2022 Call Frequency By Census Tract
+
+We will first explore the most frequent 2022 311 call topics by census tract in South Bend. This will provide insight into what residents are most frequently expressing concern about to the city through 311.
+
+```{r, message=FALSE}
+
+#Finding Top 2022 Call Topic By Call Frequency by Census Tract
+TopCalls <- CallVolume %>%
+  pivot_longer(
+    cols = !c(TRACTCE, year), 
+    names_to = "Topic", 
+    values_to = "count") %>%
+  group_by(TRACTCE, year) %>%
+  filter(count == max(count))
+
+#Adjusting Census Tract Presentation
+TopCalls$TRACTCE= TopCalls$TRACTCE/100
+
+#Merging Data with Spatial Data for Mapping
+TopCallsChart <- merge(x=TopCalls,y=census,by="TRACTCE")
+
+#Merging Call Topics For Plotting
+TopCallsChart <- merge(x=TopCallsChart,y=CallTopicMap, by="Topic")
+TopCallsChart$Code <- as.factor(TopCallsChart$Topic)
+
+#Creating Plot of Top 2022 Call Topic By Call Frequency in Each Census Tract
+ggplot(data = TopCallsChart, aes(geometry = geometry)) + geom_sf(aes(fill=TopCallsChart$Code,alpha=.5))+
+  coord_sf(crs = 4326, xlim = c(-86.4, -86.14), ylim = c(41.56, 41.756))+theme_minimal() +
+  ggtitle("Most Frequent 311 Call Topic By Census Tract",
+          subtitle = "Full Year 2022") +
+  guides(alpha="none",size="none", fill=guide_legend(title = "Call Topics",override.aes = list(alpha = 0.7))) +
+  geom_sf_text(data=census$geometry_c,label=census$TRACTCE,size=1.7)+theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(), 
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank())
+```
+
+In the above plot we can see the most frequent 311 call topic for each census tract in 2022. Neighborhood service calls stand out as the 311 call topic that most frequently is the most called about in the majority of census tracts. We can also see that utilities calls seem to be a top concern for residents in census tracts further from downtown South Bend. We will next examine the resident's expressed levels of satisfaction with major city services and see if there is a relation between the topics residents are calling into 311 about and their satisfaction with that service.
+
+### South Bend Community Survey Satisfaction By Census Tract
+
+We will now explore the South Bend major city services that receive the lowest average resident satisfaction ratings expressed through the 2022 South Bend Community Survey by census tract. This will provide insight into what residents are least satisfied about and if it relates to the topics that residents are most frequently calling 311 about by census tract.
+
+```{r, message=FALSE}
+#Finding Lowest 2022 Departmental Satisfaction By Census Tract
+DepSat <- Satisfaction2022Deps %>%
+  pivot_longer(
+    cols = !c(TRACTCE), 
+    names_to = "SatisfactionTopic", 
+    values_to = "count") %>%
+  drop_na() %>%
+  group_by(TRACTCE) %>%
+  filter(count == min(count))
+
+#Adjusting Census Tract Presentation
+DepSat$TRACTCE= DepSat$TRACTCE/100
+
+#Merging Data with Spatial Data for Mapping
+DepSatChart <- merge(x=DepSat,y=census,by="TRACTCE")
+
+#Setting Satisfaction Topic as a Factor For Plotting
+DepSatChart$SatisfactionTopic <- as.factor(DepSatChart$SatisfactionTopic)
+
+#Creating Plot of Lowest 2022 Departmental Satisfaction By Census Tract
+ggplot(data = DepSatChart, aes(geometry = geometry)) + geom_sf(aes(fill=DepSatChart$SatisfactionTopic,alpha=.5))+
+  coord_sf(crs = 4326, xlim = c(-86.4, -86.14), ylim = c(41.56, 41.756))+theme_minimal() +
+  ggtitle("Lowest Departmental Satisfaction By Census Tract",
+          subtitle = "Community Survey Year 2022 : Question 10") +
+  guides(alpha="none", size="none", fill=guide_legend(title = "Departments",override.aes = list(alpha = 0.7))) +
+  geom_sf_text(data=census$geometry_c,label=census$TRACTCE,size=1.7)+theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank())
+
+```
+
+In the above plot we can see the lowest rated city service for each census tract in 2022, based on resident responses to question 10 of the 2022 South Bend Community Survey. We can see that city maintenance satisfaction is the lowest across the majority of census tracts in 2022. Local enforcement (otherwise termed neighborhood services) is represented as the lowest rated service in the second most census tracts.
+
+There are also five census tracts which have a tie for lowest rated service and those can be found broken out below as their overlapping colors on the above chart do not accurately reflect their lowest rated service.
+
+Census Tract: 35.00 Local Enforcement and City Maintenance 
+
+Census Tract: 111.00 Trash Service, Local Enforcement, and City Maintenance
+
+Census Tract: 112.03 City Planning and City Maintenance
+
+Census Tract: 113.09 Local Police, Local Enforcement, and Construction Permit
+
+Census Tract: 117.04 Local Police, City Planning, Local Enforcement, Construction Permit, and City Maintenance
+
+This analysis begins to show connections between frequent 311 call topics by census tract and city services that receive low resident satisfaction ratings, as we can see local enforcement as a frequently poorly rated service and a topic receiving frequent 311 calls. To further investigate this we will look into residents expressed focus / investment areas for the city.
+
+### South Bend Community Survey Investment Preference By Census Tract
+
+We will now explore the top resident focus / investment preference by census tract expressed through the 2022 South Bend Community Survey. This will provide insight into what residents would like the city to devote focus to and if it relates to the topics that residents are most frequently calling 311 about and least satisfied about by census tract.
+
+```{r, message=FALSE}
+#Finding Top 2022 Investment Preference for Each Census Tract
+InvstPref <- Satisfaction2022Invs %>%
+  pivot_longer(
+    cols = !c(TRACTCE), 
+    names_to = "SatisfactionTopic", 
+    values_to = "Code") %>%
+  drop_na() %>%
+  filter(SatisfactionTopic == 'MostCommon1stInvestment')
+
+#Adjusting Census Tract Presentation
+InvstPref$TRACTCE= InvstPref$TRACTCE/100
+
+#Merging Data with Spatial Data for Mapping
+InvstPrefChart <- merge(x=InvstPref,y=census,by="TRACTCE")
+
+#Merging Investment Topics For Plotting
+InvstPrefChart <- merge(x=InvstPrefChart,y=InvestTopicMap, by="Code")
+InvstPrefChart$Topic <- as.factor(InvstPrefChart$Topic)
+
+#Creating Plot of Top 2022 Investment Preference for Each Census Tract
+ggplot(data = InvstPrefChart, aes(geometry = geometry)) + geom_sf(aes(fill=InvstPrefChart$Topic,alpha=.5))+
+  coord_sf(crs = 4326, xlim = c(-86.4, -86.14), ylim = c(41.56, 41.756))+theme_minimal() +
+  ggtitle("Top Departmental Investment Preference by Census Tract",
+          subtitle = "Community Survey Year 2022 : Question 11") +
+  guides(alpha="none",size="none",fill=guide_legend(title = "Investment Preference",override.aes = list(alpha = 0.7))) +
+  geom_sf_text(data=census$geometry_c,label=census$TRACTCE,size=1.7)+theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank())
+
+```
+
+In the above plot we can see the most frequently expressed top city focus / investment area for each census tract in 2022, based on resident responses to question 11 of the 2022 South Bend Community Survey. We can see that city maintenance is a frequent priority across the majority of census tracts in 2022. Local police is represented as the second most frequent top resident focus.
+
+### South Bend Community Survey Investment Preferences By Census Tract
+
+Finally to put all of the analysis together we examined in a tabular format residents' most frequent 311 call topic, lowest departmental satisfaction rating, and top three investment preferences by census tract.
+
+```{r, message=FALSE}
+#Joining 311 Call Volume, Lowest Departmental Satisfaction, and Top 3 Preferences
+
+#311 Calls
+TopCalls1 <- CallVolume %>%
+  pivot_longer(
+    cols = !c(TRACTCE, year), 
+    names_to = "Most Frequent 311 Call Topic", 
+    values_to = "count") %>%
+  group_by(TRACTCE, year) %>%
+  filter(count == max(count))  %>% 
+  dplyr::select(-c("count"))
+
+#Departmental Satisfaction
+DepSat1 <- Satisfaction2022Deps %>%
+  pivot_longer(
+    cols = !c(TRACTCE), 
+    names_to = "Lowest Deprtmental Satisfaction Topic", 
+    values_to = "count") %>%
+  drop_na() %>%
+  group_by(TRACTCE) %>%
+  filter(count == min(count)) %>% 
+  dplyr::select(-c("count"))
+
+#Investment Preferences
+InvstPref1 <- Satisfaction2022Invs %>%
+  pivot_longer(
+    cols = !c(TRACTCE), 
+    names_to = "SatisfactionTopic", 
+    values_to = "Code") %>%
+  filter(SatisfactionTopic == 'MostCommon1stInvestment') %>%
+  dplyr::rename("MostCommon1stInvestment" = "Code" )%>% 
+  dplyr::select(-c("SatisfactionTopic"))
+
+InvstPref2 <- Satisfaction2022Invs %>%
+  pivot_longer(
+    cols = !c(TRACTCE), 
+    names_to = "SatisfactionTopic", 
+    values_to = "Code") %>%
+  filter(SatisfactionTopic == 'MostCommon2ndInvestment') %>%
+  dplyr::rename("MostCommon2ndInvestment" = "Code" )%>% 
+  dplyr::select(-c("SatisfactionTopic"))
+
+InvstPref3 <- Satisfaction2022Invs %>%
+  pivot_longer(
+    cols = !c(TRACTCE), 
+    names_to = "SatisfactionTopic", 
+    values_to = "Code") %>%
+  filter(SatisfactionTopic == 'MostCommon3rdInvestment') %>%
+  dplyr::rename("MostCommon3rdInvestment" = "Code" ) %>% 
+  dplyr::select(-c("SatisfactionTopic"))
+
+#Merging data to create tabular format
+InvstPrefTable <- merge(x=InvstPref1,y=InvstPref2,by="TRACTCE")
+InvstPrefTable <- merge(x=InvstPrefTable,y=InvstPref3, by="TRACTCE")
+InvstPrefTable <- merge(x=InvstPrefTable,y=TopCalls1, by="TRACTCE")
+InvstPrefTable <- merge(x=InvstPrefTable,y=DepSat1, by="TRACTCE")
+InvstPrefTable <- left_join(InvstPrefTable,InvestTopicMap, by=c("MostCommon1stInvestment" = 'Code'))
+InvstPrefTable <- left_join(InvstPrefTable,InvestTopicMap, by=c("MostCommon2ndInvestment" = 'Code'))
+InvstPrefTable <- left_join(InvstPrefTable,InvestTopicMap, by=c("MostCommon3rdInvestment" = 'Code'))
+
+#Down selecting columns for final presentation
+InvstPrefTable <- InvstPrefTable %>%
+  dplyr::select(-c("year","MostCommon1stInvestment","MostCommon2ndInvestment","MostCommon3rdInvestment"))%>%
+  dplyr::rename("MostCommon1stInvestment" = "Topic.x","MostCommon2ndInvestment" = "Topic.y","MostCommon3rdInvestment" = "Topic")
+
+#Adjusting Census Tract Presentation
+InvstPrefTable$TRACTCE <- InvstPrefTable$TRACTCE/100
+InvstPrefTable = InvstPrefTable[!duplicated(InvstPrefTable$TRACTCE), ]
+row.names(InvstPrefTable) <- NULL
+
+#Improving Format
+InvstPrefTable[1:15,] %>%
+  dplyr::rename("Cencus Tract" = TRACTCE) %>%
+  kbl() %>%
+  kable_styling(position = "center")
+
+```
+
+When looking at the above sample of tabular analysis we see that residents have frequently rated their top call topic and least satisfied department in their top investment preferences. Thus, the city can utilize 311 call volume by census tract as a rough measure of the satisfaction of a particular census track with major city services.
+
+Also we can see that across the community residents are calling in frequently for neighborhood services / local enforcement issues. Residents are also expressing the high dissatisfaction with neighborhood services via the 2022 South Bend Community Survey and are indicating it as a top priority for city focus and investment. To further investigate this and present specific actions the city can take in response to these concern we have identified top neighborhood services and city maintenance subtopics by tract using questions from the South Bend Community Survey that address more granular levels of the satisfaction with the services in question.
+
+### Neighborhood Services and Enforcement Resident Top Focus
+
+```{r, message=FALSE}
+#Finding Top 2022 Neighborhood Services Investment Preference by Census Tract
+InvstPrefQ21 <- Satisfaction2022DisQ21 %>%
+  pivot_longer(
+    cols = !c(TRACTCE), 
+    names_to = "SatisfactionTopic", 
+    values_to = "Code") %>%
+  drop_na() %>%
+  group_by(TRACTCE) %>%
+  filter(SatisfactionTopic == 'MostCommon1stCityLeaderEmphasis')
+
+#Adjusting Census Tract Presentation
+InvstPrefQ21$TRACTCE= InvstPrefQ21$TRACTCE/100
+
+#Merging Data with Spatial Data for Mapping
+InvstPrefChartQ21 <- merge(x=InvstPrefQ21,y=census,by="TRACTCE")
+
+#Merging Investment Topics for Mapping
+InvstPrefChartQ21 <- merge(x=InvstPrefChartQ21,y=InvestTopicMap2, by="Code")
+InvstPrefChartQ21$Topic <- as.factor(InvstPrefChartQ21$Topic)
+
+#Creating Plot of Top 2022 Neighborhood Services Investment Preference by Census Tract
+ggplot(data = InvstPrefChartQ21, aes(geometry = geometry)) + geom_sf(aes(fill=InvstPrefChartQ21$Topic,alpha=.5))+
+  coord_sf(crs = 4326, xlim = c(-86.4, -86.14), ylim = c(41.56, 41.756))+theme_minimal() +
+  ggtitle("Top Neighborhood Services and Enforcement Investment Preference",
+          subtitle = "Community Survey Year 2022 : Question 21") +
+  guides(alpha="none",size="none",fill=guide_legend(title = "Investment Preference",override.aes = list(alpha = 0.7))) +
+  geom_sf_text(data=census$geometry_c,label=census$TRACTCE,size=1.7)+theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank())
+
+```
+
+In the above plot we focus in on residents top priorities for Neighborhood Services and Enforcement. We can see that trash clean up enforcement is the top city focus / investment area for most census tracts in 2022. A second focus is business exterior maintenance which occurs frequently in census tracts closer to downtown.
+
+### Traffic and Transportation Resident Top Focus
+
+```{r, message=FALSE}
+#Finding Top 2022 Traffic and Transportation Investment Preference by Tract
+InvstPrefQ26 <- Satisfaction2022DisQ26 %>%
+  pivot_longer(
+    cols = !c(TRACTCE), 
+    names_to = "SatisfactionTopic", 
+    values_to = "Code") %>%
+  drop_na() %>%
+  group_by(TRACTCE) %>%
+ filter(SatisfactionTopic == 'MostCommon1stCityMaintenencePriority')
+
+#Adjusting Census Tract Presentation
+InvstPrefQ26$TRACTCE= InvstPrefQ26$TRACTCE/100
+
+#Merging Data with Spatial Data for Mapping
+InvstPrefChartQ26 <- merge(x=InvstPrefQ26,y=census,by="TRACTCE")
+
+#Merging Investment Topics for Mapping
+InvstPrefChartQ26 <- merge(x=InvstPrefChartQ26,y=InvestTopicMapQ27, by="Code")
+InvstPrefChartQ26$Topic <- as.factor(InvstPrefChartQ26$Topic)
+
+#Creating Plot of Top 2022 Traffic and Transportation Investment Preference by Tract
+ggplot(data = InvstPrefChartQ26, aes(geometry = geometry)) + geom_sf(aes(fill=InvstPrefChartQ26$Topic,alpha=.5))+
+  coord_sf(crs = 4326, xlim = c(-86.4, -86.14), ylim = c(41.56, 41.756))+theme_minimal() +
+  ggtitle("Top Traffic and Transportation Investment Preference",
+          subtitle = "Community Survey Year 2022 : Question 27") +
+  guides(alpha="none",size="none",fill=guide_legend(title = "Investment Preference",override.aes = list(alpha = 0.7))) +
+  geom_sf_text(data=census$geometry_c,label=census$TRACTCE,size=1.7)+theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank())
+
+```
+
+In the above plot we focus in on residents top priorities for Traffic and Transportation. We can see that the condition of major city streets is the top city focus / investment area for most census tracts in 2022. There is not a stand out second focus, but adequacy of street lights and neighborhood snow removal both appear as top issues in at least four census tracts.
+
+### Solid Waste Resident Top Focus
+
+```{r, message=FALSE}
+#Finding Top 2022 Solid Waste Investment Preference for Each Census Tract
+InvstPrefQ23 <- Satisfaction2022DisQ23 %>%
+  pivot_longer(
+    cols = !c(TRACTCE), 
+    names_to = "SatisfactionTopicQ23", 
+    values_to = "Code") %>%
+  drop_na() %>%
+  group_by(TRACTCE) %>%
+ filter(SatisfactionTopicQ23 == 'MostCommon1stSolidWastePriority')
+
+#Adjusting Census Tract Presentation
+InvstPrefQ23$TRACTCE= InvstPrefQ23$TRACTCE/100
+
+#Merging Data with Spatial Data for Mapping
+InvstPrefChartQ23 <- merge(x=InvstPrefQ23,y=census,by="TRACTCE")
+
+#Merging Investment Topics for Mapping
+InvstPrefChartQ23 <- merge(x=InvstPrefChartQ23,y=InvestTopicMapQ23, by="Code")
+InvstPrefChartQ23$Topic <- as.factor(InvstPrefChartQ23$Topic)
+
+#Creating Plot of Top 2022 Solid Waste Investment Preference by Tract
+ggplot(data = InvstPrefChartQ23, aes(geometry = geometry)) + geom_sf(aes(fill=InvstPrefChartQ23$Topic,alpha=.5))+
+  coord_sf(crs = 4326, xlim = c(-86.4, -86.14), ylim = c(41.56, 41.756))+theme_minimal() +
+  ggtitle("Top Solid Waste Investment Preference",
+          subtitle = "Community Survey Year 2022 : Question 23") +
+  guides(alpha="none",size="none",fill=guide_legend(title = "Investment Preference",override.aes = list(alpha = 0.7))) +
+  geom_sf_text(data=census$geometry_c,label=census$TRACTCE,size=1.7)+theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank())
+
+```
+
+In the above plot we focus in on residents top priorities for Solid Waste. We can see that trash service charges are the top city focus / investment area for most census tracts in 2022. There is not a stand out second focus, but bulk item removal seems to be a priority in the north of the city while more central census tracts are more focused on improving the city's efforts to keep them informed of disruptions to trash service.
+
+### Public Safety Resident Top Focus
+
+```{r, message=FALSE}
+#Finding Top 2022 Public Safety Investment Preference for Each Census Tract
+InvstPrefQ25 <- Satisfaction2022DisQ25 %>%
+  pivot_longer(
+    cols = !c(TRACTCE), 
+    names_to = "SatisfactionTopicQ25", 
+    values_to = "Code") %>%
+  drop_na() %>%
+  group_by(TRACTCE) %>%
+ filter(SatisfactionTopicQ25 == 'MostCommon1stPoliceAndFirePriority')
+
+#Adjusting Census Tract Presentation
+InvstPrefQ25$TRACTCE= InvstPrefQ25$TRACTCE/100
+
+#Merging Data with Spatial Data for Mapping
+InvstPrefChartQ25 <- merge(x=InvstPrefQ25,y=census,by="TRACTCE")
+
+#Merging Investment Topics for Mapping
+InvstPrefChartQ25 <- merge(x=InvstPrefChartQ25,y=InvestTopicMapQ25, by="Code")
+InvstPrefChartQ25$Topic <- as.factor(InvstPrefChartQ25$Topic)
+
+#Creating Plot of Top 2022 Public Safety Investment Preference by Tract
+ggplot(data = InvstPrefChartQ25, aes(geometry = geometry)) + geom_sf(aes(fill=InvstPrefChartQ25$Topic,alpha=.5))+
+  coord_sf(crs = 4326, xlim = c(-86.4, -86.14), ylim = c(41.56, 41.756))+theme_minimal() +
+  ggtitle("Top Public Safety Investment Preference",
+          subtitle = "Community Survey Year 2022 : Question 25") +
+  guides(alpha="none",size="none",fill=guide_legend(title = "Investment Preference",override.aes = list(alpha = 0.7))) +
+  geom_sf_text(data=census$geometry_c,label=census$TRACTCE,size=1.7)+theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank())
+
+```
+
+In the above plot we focus in on residents top priorities for Public Safety. We can see that feeling safe in one's neighborhood is the top city focus / investment area for most census tracts in 2022. The second focus would be enforcement of local traffic laws, while a third grouping is represented by tracts concerned about the relationship between police and the community. All three groupings are spread across the city with no apparent trend in location.
+
+### Water Resident Top Focus
+
+```{r, message=FALSE}
+#Finding Top 2022 Water Investment Preference for Each Census Tract
+InvstPrefQ29 <- Satisfaction2022DisQ29 %>%
+  pivot_longer(
+    cols = !c(TRACTCE), 
+    names_to = "SatisfactionTopicQ29", 
+    values_to = "Code") %>%
+  drop_na() %>%
+  group_by(TRACTCE) %>%
+ filter(SatisfactionTopicQ29 == 'MostCommon1stWaterPriority')
+
+#Adjusting Census Tract Presentation
+InvstPrefQ29$TRACTCE= InvstPrefQ29$TRACTCE/100
+
+#Merging Data with Spatial Data for Mapping
+InvstPrefChartQ29 <- merge(x=InvstPrefQ29,y=census,by="TRACTCE")
+
+#Merging Investment Topics for Mapping
+InvstPrefChartQ29 <- merge(x=InvstPrefChartQ29,y=InvestTopicMapQ29, by="Code")
+InvstPrefChartQ29$Topic <- as.factor(InvstPrefChartQ29$Topic)
+
+#Creating Plot of Top 2022 Water Investment Preference by Tract
+ggplot(data = InvstPrefChartQ29, aes(geometry = geometry)) + geom_sf(aes(fill=InvstPrefChartQ29$Topic,alpha=.5))+
+  coord_sf(crs = 4326, xlim = c(-86.4, -86.14), ylim = c(41.56, 41.756))+theme_minimal() +
+  ggtitle("Top Water Investment Preference",
+          subtitle = "Community Survey Year 2022 : Question 29") +
+  guides(alpha="none",size="none",fill=guide_legend(title = "Investment Preference",override.aes = list(alpha = 0.7))) +
+  geom_sf_text(data=census$geometry_c,label=census$TRACTCE,size=1.7)+theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank())
+
+
+```
+
+In the above plot we focus in on residents top priorities for Water. We can see that utility charges are the top city focus / investment area for most census tracts in 2022. The remaining topics are rather disjointed with no group making up a large majority, however, it is interesting to note that all tracts prioritizing the taste of their tap water as a focus for the city are located on the north west side of the city.
+
+### Venues, Parks, and Arts Resident Top Focus
+
+```{r, message=FALSE}
+#Finding Top 2022 Venues, Parks, and Arts Invest Pref for Each Census Tract
+InvstPrefQ31 <- Satisfaction2022DisQ31 %>%
+  pivot_longer(
+    cols = !c(TRACTCE), 
+    names_to = "SatisfactionTopicQ31", 
+    values_to = "Code") %>%
+  drop_na() %>%
+  group_by(TRACTCE) %>%
+ filter(SatisfactionTopicQ31 == 'MostCommon1stParksPriority')
+
+#Adjusting Census Tract Presentation
+InvstPrefQ31$TRACTCE= InvstPrefQ31$TRACTCE/100
+
+#Merging Data with Spatial Data for Mapping
+InvstPrefChartQ31 <- merge(x=InvstPrefQ31,y=census,by="TRACTCE")
+
+#Merging Investment Topics for Mapping
+InvstPrefChartQ31 <-merge(x=InvstPrefChartQ31,y=InvestTopicMapQ31, by="Code")
+InvstPrefChartQ31$Topic <- as.factor(InvstPrefChartQ31$Topic)
+
+#Creating Plot of Top 2022 Venues, Parks, and Arts Invest Pref by Census Tract
+ggplot(data = InvstPrefChartQ31, aes(geometry = geometry)) + geom_sf(aes(fill=InvstPrefChartQ31$Topic,alpha=.5))+
+  coord_sf(crs = 4326, xlim = c(-86.4, -86.14), ylim = c(41.56, 41.756))+theme_minimal() +
+  ggtitle("Top Venues, Parks, and Arts Investment Preference",
+          subtitle = "Community Survey Year 2022 : Question 31") +
+  guides(alpha="none",size="none",fill=guide_legend(title = "Investment Preference",override.aes = list(alpha = 0.7))) +
+  geom_sf_text(data=census$geometry_c,label=census$TRACTCE,size=1.7)+theme(axis.text.x=element_blank(),
+        axis.ticks.x=element_blank(),
+        axis.text.y=element_blank(),
+        axis.ticks.y=element_blank(),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank())
+```
+
+In the above plot we focus in on residents top priorities for Venues, Parks, and Arts. We can see that the maintenance of city parks is the top city focus / investment area for most census tracts in 2022. The second focus would be the condition of restrooms in public parks. It appears that restrooms are more generally cited as a top priority if the census track is closer to the downtown of the city.
+
+### Summarizing the Community Investment Preferences
+
+Through the above analysis we have seen the relation between 311 call volume by topic, and resident satisfaction and investment preferences expressed through the South Bend Community Survey. It seems that residents frequently are dissatisfied with topics that they are frequently calling about and that residents frequently rate their highest call volume items as top areas for the city to improve, when viewed by census tract. Finally in an attempt to identify actionable insights in each census tract we examined residents top investment priorities within each major city service through the lens of the more granular survey questions within the Community Survey. In this examination we identified the top concerns that were echoed across census tracts and called out groupings of specific concerns that may be of interest to the city for further investigation.
+
+# Sentiment Analysis
+
+Sentiment Analysis is a method used to computationally extract the underlying emotions or attitudes expressed in a piece of text. Sentiment analysis was performed on the CRM 311 in order to further analyze the South Bend residents' satisfaction during their calls to the 311 call center. The analysis utilized two of the columns in the merged data from the Phone Call and Knowledge Article tables. The columns were the cosb_knowledgearticlename and the phone call description.
+
+### Sentiment Analysis on Knowledge Article Title
+
+Analysis on the Knowledge Article name was performed first since the text has a shorter length and thus, requires less time and computational resources. Before getting into the sentiment piece, a quick exploratory analysis was performed were the frequency of each topic and character length were investigated. Below are the results.
+
+```{r echo=FALSE}
+#exploratory data analysis
+unique_topics_full_set <- ki_merged %>% 
+  dplyr::select(cosb_knowledgearticlename.y) %>%
+  group_by(cosb_knowledgearticlename.y) %>%
+  dplyr::summarise(Frequency = n()) %>% arrange(desc(Frequency)) %>% 
+  dplyr::rename("Knowledge Article Title" = cosb_knowledgearticlename.y)
+
+
+knitr::kable(unique_topics_full_set[1:15,], "html") %>%
+  kable_styling(position = "center")
+```
+
+There are different lexicons that can be used to perform the analysts. A lexicon is a vocabulary of words that have been previously rated in terms of sentiment. The sentiment analysis package from the tidyverse package has 2 lexicons (bing and affin) that rate the words on a scale from positive to negative sentiment. Both were utilized on the Knowledge Article Title to asses which one was the most accurate at providing a sentiment.
+
+#### Bing Lexicon
+
+The BING lexicon categorizes words in a binary fashion, either positive or negative.This lexicon was created by the Bing Liu and collaborators and was leveraged to derive the sentiment scores for the Knowledge Article title.
+
+```{r results = FALSE, warning=FALSE, message=FALSE, echo=FALSE}
+## Sentiment on Article Topic with BING lexicon
+#create new variable with all the article topics
+unique_topics<-tolower(unique_topics_full_set$`Knowledge Article Title`)
+#array to save the positive and negative scores
+negative = c()
+positive = c()
+
+j=1
+for (i in 1:length(unique_topics)) {
+  ##mini-sentiment analysis with bing lexicon from tidytext package
+  tokens <- data_frame(text = unique_topics[i]) %>% unnest_tokens(word, text)
+  #get the sentiment from the first topic: 
+  scores <- tokens %>%
+  dplyr::inner_join(get_sentiments("bing")) %>% # pull out only sentiment words
+  dplyr::count(sentiment) #%>% # count the # of positive & negative words
+  #save results on array
+  if (nrow(scores)!= 0){
+    negative[j] <- ifelse(scores$sentiment == 'negative', scores$n, 0)
+    positive[j] <- ifelse(scores$sentiment == 'positive', scores$n, 0)
+  }
+  else{
+    negative[j] <- 0
+    positive[j] <- 0
+  }
+  #print every 20 iterations the counter in the loop
+  if (i%%20 == 0){print(i)}
+  j<-j+1
+}
+```
+
+
+```{r echo=FALSE}
+#visualization of results
+tokens <- data_frame(text = unique_topics_full_set$`Knowledge Article Title`) %>% unnest_tokens(word, text)
+# get the sentiment from the first text: 
+scores<-tokens %>%
+dplyr::inner_join(get_sentiments("bing"))
+
+
+scores_visual<-tokens %>%
+dplyr::inner_join(get_sentiments("bing")) %>% # pull out only sentiment words
+dplyr::count(sentiment) 
+
+k=length(tokens)
+
+ggplot(scores_visual, aes(x="",y=n, fill=sentiment)) +
+  geom_bar(stat = "identity", alpha=0.9, color='black') +
+  coord_polar("y", start=0) + scale_fill_viridis_d() + theme_void()+
+  geom_text(aes(label = paste0(as.character(round(n/sum(n), 2)*100), "%")),
+             color = "black",
+             position = position_stack(vjust = 0.5),
+             show.legend = FALSE) + 
+  ggtitle("Bing Lexicon: Proportion of Negative and Positive\n Sentiments in Knowledge Article Titles")
+```
+
+Look at the results above, we can see that there are an overwhelming number of negative words in the knowledge article titles.
+
+#### Affin Lexicon
+
+The Knowledge Article Title was also run through the affin lexicon. The affin lexicon has a scale between -5 for negative word sentiment and +5 for positive word sentiment and was created by Finn Årup Nielsen between 2009 and 2011.
+
+```{r results = FALSE, warning=FALSE, message=FALSE, echo=FALSE}
+#Affin Lexicon
+## Article Title sentiment with Affin Lexicon
+unique_topics<-unique_topics_full_set$`Knowledge Article Title`
+affin_score<- c()
+j=1
+for (i in 1:length(unique_topics)) {
+  ##mini-sentiment analysis with bing lexicon from tidyverse package
+  tokens <- data_frame(text = unique_topics[i]) %>% unnest_tokens(word, text)
+  # get the sentiment from the first topic: 
+  scores <- tokens %>%
+  inner_join(get_sentiments("afinn"))
+  affin_score[j] <- mean(scores$value)
+  if (i%%20 == 0){print(i)}
+  j<-j+1
+}
+```
+
+The overall sentiment using the affin lexicon was also negative.
+
+```{r echo=FALSE}
+affin_score_df = data.frame(affin_score)
+affin_score_df$sentiment = ifelse(affin_score>=0, "positive", "negative")
+affin_score_df<-affin_score_df %>% dplyr::count(sentiment)
+
+
+
+ggplot(affin_score_df, aes(x="",y=n, fill=sentiment)) +
+  geom_bar(stat = "identity", alpha=0.9, color='black') +
+  coord_polar("y", start=0) + scale_fill_viridis_d(begin = 1, end=0, direction=-1, na.value="lightblue") + theme_void()+
+  geom_text(aes(label = paste0(as.character(round(n/sum(n), 2)*100), "%")),
+             color = "black",
+             position = position_stack(vjust = 0.5),
+             show.legend = FALSE) + 
+  ggtitle("Affin Lexicon: Proportion of Negative and Positive\n Sentiments in Knowledge Article Titles")
+```
+
+The Affin Lexicon also attributed a negative sentiment to titles far more often than positive sentiments, however this lexicon fialed to assign a sentiment to a significant number of the words, making it not an ideal solution for this situation.
+
+#### Results
+
+The BING lexicon performed better than the affin lexicon based on the amount of instances in which affin was not able to come up with a score and also common sense by looking over a few examples provided on the table below. A negative score indicates a negative sentiment, a 0 indicates neutral, and a positive value would indicate positive sentiment.
+
+```{r echo=FALSE}
+results <- cbind(unique_topics_full_set, (positive-negative), affin_score)
+results$affin_score = str_replace(results$affin_score, "NaN", "Unknown Sentiment")
+
+results = results %>% 
+  dplyr::rename("Bing Sentiment Score" = "(positive - negative)", 
+                "Affin Sentiment Score" = affin_score) %>%
+  dplyr::select(-Frequency)
+
+
+knitr::kable(results[1:15,], format = "html") %>%
+  kable_styling(position = "center")
+```
+
+### Sentiment Analysis on Phone Call Description
+
+To get s little bit more information to determine the sentiment of the call, sentiment analysis on the was also performed. Similar to the bing analysis, a first quick look at the column via exploratory analysis was done. Below is a sample of the Knowledge Article Titles with the most empty descriptions.
+
+```{r echo=FALSE}
+#checking ratio of null descriptions per article title to be aware of the limitations on the data
+df <- ki_merged %>% group_by(cosb_knowledgearticlename.y) %>% 
+  dplyr::summarize("Number of Articles"=n(), null = sum(is.na(description)), 
+                   "Percentage" = round(sum(is.na(description))/n(), 2)) %>% 
+  dplyr::filter( null > 50) %>%
+  dplyr::arrange(desc(round(Percentage,2))) %>% 
+  dplyr::mutate(Percentage = paste0(Percentage*100, "%")) %>%
+  dplyr::rename("Knowledge Article" = cosb_knowledgearticlename.y, "Empyty Descriptions" = null)
+
+knitr::kable(df[1:10,], "html") %>%
+  kable_styling(position = "center")
+```
+
+Since there are some calls with no phone call description, the null values were filled in with the article topic whenever no description was available.
+
+```{r echo=FALSE}
+descriptions <- ki_merged$description
+##Overall sentiment based on descriptions When no description found use service request name
+descriptions <- with(ki_merged, ifelse(description=="", cosb_knowledgearticlename.y,description))
+```
+
+Due to computational constraints, the sentiment analysis on this column was only run using the BING lexicon. We chose the bing lexicon over the affin lexicon based on its past performance on the Knowledge Article Title analysis.
+
+```{r results==FALSE, echo=FALSE}
+# DO NOT RUN; TAKES A LONG TIME
+## Description sentiment
+#negative1 = c()
+#positive1 = c()
+#j=1
+#for (i in 1:length(descriptions)) {
+  ##mini-sentiment analysis with bing lexicon from tidyverse package
+  #tokens <- data_frame(text = descriptions[i]) %>% unnest_tokens(word, text)
+  # get the sentiment from the first description: 
+  #scores1 <- tokens %>%
+  #inner_join(get_sentiments("bing")) %>% # pull out only sentiment words
+  #count(sentiment) #%>% # count the # of positive & negative words
+  #if (nrow(scores1)!= 0){
+  #  negative1[j] <- sum(ifelse(scores1$sentiment == 'negative', scores1$n, 0))
+  #  positive1[j] <- sum(ifelse(scores1$sentiment == 'positive', scores1$n, 0))
+  #}
+  #else{
+  #  negative1[j] <- 0
+  #  positive1[j] <- 0
+  #}
+  #print every 20 iterations the couter in the loop
+  #if (i%%1000 == 0){print(i)}
+  #j<-j+1
+#}
+```
+
+### Results
+
+```{r echo=FALSE}
+### The following is used to join the scores to a final table.
+## Join sentiments to unique topics data
+#sentiment_set <- cbind(cbind(unique_topics_full_set,positive), negative)
+#sentiment_set %>% mutate(net_score = positive - negative) %>% mutate(afinn_score = affin_score)
+```
+
+```{r echo=FALSE}
+#ki_merged <- cbind(ki_merged, positive1, negative1)
+#ki_merged$netscore_description <- positive1 - negative1
+#ki_merged <- ki_merged[1:(length(ki_merged)-2)]
+
+#ki_merged %>% group_by(cosb_knowledgearticlename.y)%>%aggregate(sum(ki_merged$netscore1))
+#description_mean <- aggregate(ki_merged$netscore1, list(ki_merged$cosb_knowledgearticlename.y), mean)
+
+#colnames(description_mean)[1] <- 'cosb_knowledgearticlename.y'
+#ki_merged <- ki_merged[1:(length(ki_merged)-3)]
+
+
+## Join sentiments to unique topics data
+#sentiment_set <- cbind(cbind(unique_topics_full_set,positive), negative)
+#sentiment_set$netscore_articletitle <- sentiment_set$positive - sentiment_set$negative
+
+
+#ki_merge2<- merge(x = ki_merged, y = sentiment_set, by = "cosb_knowledgearticlename.y", all.x = TRUE)
+#ki_merge2<- merge(x = ki_merge2, y = description_mean, by = "cosb_knowledgearticlename.y", all.x = TRUE)
+#ki_merge2
+#ki_merge2 <- cbind(ki_merged2, positive1, negative1)
+#ki_merge2$netscore_description <- positive1 - negative1
+
+#colnames(ki_merge2)[colnames(ki_merge2) == 'positive1'] <- 'positive_description'
+#colnames(ki_merge2)[colnames(ki_merge2) == 'negative1'] <- 'negative_description'
+#colnames(ki_merge2)[colnames(ki_merge2) == 'positive'] <- 'positive_articletittle'
+#colnames(ki_merge2)[colnames(ki_merge2) == 'negative'] <- 'negative_articletitle'
+#colnames(ki_merge2)[colnames(ki_merge2) == 'x'] <- 'categoryscore_description'
+
+#ki_merge2
+```
+
+```{r echo=FALSE}
+###These agregations were written to the ki_sentiment_merge file. This file was the used by a srcipt on the supplemental section to add census tract information.
+#write merged dataset to csv file
+#write.csv(ki_merge2, "C:\\Users\\anala\\Documents\\Grad School\\Data Science Now\\ki_sentiment_merge.csv", row.names=FALSE)
+```
+
+The output of the sentiment analysis from the phone call description was then joined to the census tract. The scores were then aggregated at a census tract level by averaging the net score of the result and counting the number of calls received by the 311 call centers based on different topics. An sample of the resulting data set can be observed below.
+
+```{r echo=FALSE}
+#reading joined files for each year and aggregating them together
+df2018<- read.csv("CallVolumeByCT_2018.csv")
+df2020<- read.csv("CallVolumeByCT_2020.csv")
+df2022<- read.csv("CallVolumeByCT_2022.csv")
+
+df2018$year<- '2018'
+df2020$year<- '2020'
+df2022$year<- '2022'
+df <- rbind(df2018, df2020, df2022)
+df$TRACTCE = df$TRACTCE / 100
+df$TRACTCE <- str_replace(as.character(df$TRACTCE), ".00", "")
+
+
+df[1:5,] %>% 
+  dplyr::select(TRACTCE, 
+                AvgArticleTitleSentiment, AvgDescriptionSentiment) %>% 
+  dplyr::rename("Census Tract" = TRACTCE, 
+                "Average Sentiment of Article Title" = AvgArticleTitleSentiment,
+                "Average Sentiment of Article Description" = AvgDescriptionSentiment) %>%
+  knitr::kable("html") %>%
+  kable_styling(position = "center")
+```
+
+### Summarizing the Highest and Lowest Average Sentiment Census Tracts
+
+Based on this analysis, the census tracts with the top 10 high and low sentiment scores can be identified as shown by the tables below.
+
+#### Top 10 Lowest Scores
+
+These 10 census tracts represent areas were the 311 call center and the city of South Bend have the largest area of opportunity to influence resident's sentiment during a phone call and by consequence customer satisfaction with its services.
+
+```{r echo=FALSE}
+#Filtering out census tracts with less than 60 calls since there is not enough information to make an inference and obtaining top 10 lowest scores.
+top10Low <- df2022 %>% dplyr::select(X, AvgDescriptionSentiment, TotalCalls) %>% 
+  dplyr::filter(TotalCalls > 60) %>% arrange(AvgDescriptionSentiment) %>% 
+  dplyr::rename("Census Tract" = X, 
+                "Total Calls" = TotalCalls,
+                "Average Sentiment of Article Description" = AvgDescriptionSentiment) 
+
+
+knitr::kable(top10Low[1:10,], format = "html") %>%
+  kable_styling(position = "center")
+```
+
+#### Top 10 Highest Scores
+
+These 10 census tracts represent areas were the 311 call center and the city of South Bend have a smaller area of opportunity to influence resident's sentiment during a phone call. These census are the ones with the most positive sentiment out of all the census tracts.
+
+```{r echo=FALSE}
+#Filtering out census tracts with less than 60 calls since there is not enough information to make an inference and obtaining top 10 highest scores.
+top10High <- df2022 %>% dplyr::select(X, AvgDescriptionSentiment, TotalCalls) %>%
+  dplyr::filter(TotalCalls >60) %>%
+  dplyr::arrange(desc(AvgDescriptionSentiment)) %>% 
+  dplyr::rename("Census Tract" = X, 
+                "Total Calls" = TotalCalls,
+                "Average Sentiment of Article Description" = AvgDescriptionSentiment) 
+
+
+knitr::kable(top10High[0:10,], "html") %>%
+  kable_styling(position = "center")
+```
+
+Finally, the sentiment score was correlated with the number of calls from each census on different topics to see if there were any trends worth noticing.
+
+```{r echo=FALSE, warning=FALSE}
+#create correlation plot
+df2022<- df2022 %>% filter(TotalCalls > 60)
+cordf<- df2022[, 4:21]
+
+corrplot(cor(cordf[1:18,], use="pairwise.complete.obs")[18,1:16, drop=FALSE], 
+         cl.pos='n', col=brewer.pal(n=8, name="RdYlBu"))
+
+```
+
+The chart above shows there is a strong negative correlation between the number of calls regarding Neighborhood Service Call and average description sentiment. Meaning that the more calls a census tract get the lower the sentiment of the call tends to be. The opposite effect can be observed when it comes to calls regarding Facilities Ground Calls.
+
+In conclusion, Sentiment analysis is a powerful technique that can serve as indicators of the emotions or moods expressed during the phone call that can give insight into areas of opportunities for improvement for the 311 Call Center and the City of South Bend as a whole. These analysis highlighted the areas of Neighborhood Services and Animal Resource Center Calls more specifically.
+
+# Conclusion
+
+Our analysis focused on five key topics relevant to the CIty of South Bend: 311 usage and reporting behavior, demographic disparities within the city, resident investment preferences, trends over time in community survey results, and a sentiment analysis of 311 calls. Each of these topics was analyzed using a mixture of the city’s 311 calls data, the South Bend Community Survey data , and the American Community Survey (ACS) data. By looking at these separate datasets together we were able to identify trends and insights between each data source that may otherwise have gone unnoticed. Selected key findings from our analysis and actionable steps the city could take include: 
+
+1. The identification of census tracts that are underutilizing the city’s 311 service and thus may be targets for additional 311 service marketing and educational programs.
+2. The identification of differences in satisfaction with city services between races, genders, and income levels which could enable the city to adjust services to combat inequality.
+3. The identification of a correlation between 311 call volume by topic and resident investment preferences and dissatisfactions at a census tract level and identification of top areas of resident desired investment which could enable the city to address dissatisfaction in ways specific to each census tract.
+
+### Assumptions and Limitations:
+
+There are limitations of our analysis that should be taken into consideration when analyzing our findings. When using 311 call data we made the assumption that the call location recorded for a 311 interaction is within the resident’s home census tract and that issues discussed on the call also pertained to their home census tract. While we believe this assumption is accurate for most cases, this may not always be the case as residents could call in from locations outside their census tract, may have outdated location information on record with 311, or may be calling from their census tract but calling about issues elsewhere in the city. We also faced practical limitations in the amount of data that we could work with. The South Bend Community Survey was used extensively in our work to identify resident satisfaction and investment preferences at a census tract level, however the survey has received only 600-700 responses when in the years it is administered. Based on this response rate and the number of census tracts examined across the city, it was not uncommon for our results at a census tract level to be based on an aggregation of 10 or less resident responses within a given census tract. This low level of responses available could mean that outlier opinions could skew the interpretation of resident opinions at a census tract level and should be considered when evaluating the results. Finally, when working with demographic data from the ACS we made the assumption that the demographics shown in the ACS data corresponded with the demographics of the residents providing South Bend Community Survey responses and 311 calls in a given census tract. We can not confirm that the demographics expressed in the ACS accurately reflect the makeup of the residents surveyed in the South Bend Community Survey for the census tract or the makeup of residents with the census tract making use of the 311 service.
+
+
+
+### Contact Information:
+Trevor Coville:  trevorcoville\@gmail.com
+
+Cole Leppert:  leppertcole\@gmail.com
+
+Helen Flynn:  hmsflynn\@gmail.com
+
+Austin Kim:  austinek94\@gmail.com
+
+Ana Dominguez:  analauradmngz\@gmail.com
+
+Alexa Myers:  amyers\@resultant.com
+
+
+
+
